@@ -43,3 +43,7 @@ config.yaml
 
 # Node
 node_modules/
+
+# Extra safety for secrets
+*.env
+config/*.yaml
