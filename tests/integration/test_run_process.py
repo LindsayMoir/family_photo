@@ -33,7 +33,6 @@ def test_run_process_advances_detected_sheet_without_touching_database(
             target="sheet_id=11",
             processed_count=1,
             detected_count=2,
-            review_required_count=0,
             dry_run=True,
         ),
     )
@@ -68,7 +67,6 @@ def test_run_process_advances_detected_sheet_without_touching_database(
     assert summary.target == "sheet_id=11"
     assert summary.sheets_processed == 1
     assert summary.photos_processed == 2
-    assert summary.review_required_sheets == 0
     assert summary.dry_run is True
     assert stage_calls == [
         ("crop", 11),
@@ -81,7 +79,7 @@ def test_run_process_advances_detected_sheet_without_touching_database(
     ]
 
 
-def test_run_process_stops_after_review_required_detection(app_config, monkeypatch) -> None:
+def test_run_process_continues_even_when_detection_finds_no_candidates(app_config, monkeypatch) -> None:
     sheet = SheetScanRecord(
         id=22,
         batch_name="batch-b",
@@ -99,14 +97,15 @@ def test_run_process_stops_after_review_required_detection(app_config, monkeypat
             target="sheet_id=22",
             processed_count=1,
             detected_count=0,
-            review_required_count=1,
             dry_run=True,
         ),
     )
+    stage_calls: list[tuple[str, int]] = []
     monkeypatch.setattr(
         "pipeline.service.run_crop",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("crop should not run")),
+        lambda *args, **kwargs: stage_calls.append(("crop", kwargs["sheet_id"])),
     )
+    monkeypatch.setattr("pipeline.service.list_photo_ids_for_sheet", lambda *args, **kwargs: [])
 
     summary = run_process(
         app_config,
@@ -119,4 +118,4 @@ def test_run_process_stops_after_review_required_detection(app_config, monkeypat
     )
 
     assert summary.photos_processed == 0
-    assert summary.review_required_sheets == 1
+    assert stage_calls == [("crop", 22)]

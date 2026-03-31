@@ -5,7 +5,6 @@ from detection.service import (
     _intersection_over_smaller_area,
     _preview_path,
     _region_crop_path,
-    _review_decision,
 )
 
 
@@ -32,28 +31,6 @@ def _candidate(
         rectangularity=0.95,
         confidence=confidence,
     )
-
-
-def test_review_decision_requires_review_when_no_candidates(sample_sheet_scan) -> None:
-    review_required, review_reason = _review_decision(
-        sample_sheet_scan,
-        [],
-        image_path=sample_sheet_scan.original_path,
-    )
-
-    assert review_required is True
-    assert review_reason == "no_candidates"
-
-
-def test_review_decision_requires_review_for_low_confidence_candidate(sample_sheet_scan) -> None:
-    review_required, review_reason = _review_decision(
-        sample_sheet_scan,
-        [_candidate(x1=0, y1=0, x2=100, y2=100, confidence=0.59)],
-        image_path=sample_sheet_scan.original_path,
-    )
-
-    assert review_required is True
-    assert review_reason == "low_confidence_candidates"
 
 
 def test_intersection_over_smaller_area_uses_smaller_box_as_denominator() -> None:

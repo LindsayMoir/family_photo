@@ -19,7 +19,6 @@ def test_run_batch_smoke_reports_exports_and_review_state(app_config, monkeypatc
             target="sheet_id=31",
             sheets_processed=1,
             photos_processed=2,
-            review_required_sheets=0,
             dry_run=False,
         ),
     )
@@ -45,12 +44,12 @@ def test_run_batch_smoke_reports_exports_and_review_state(app_config, monkeypatc
         lambda *args, **kwargs: ReviewTaskSummary(task_counts={"review_orientation": 1}),
     )
     monkeypatch.setattr(
-        "pipeline.service.get_next_sheet_task",
+        "pipeline.service.get_next_task",
         lambda *args, **kwargs: ReviewTask(
             id=9,
             entity_type="sheet",
             entity_id=31,
-            task_type="review_detections",
+            task_type="review_orientation",
             status="open",
             priority=10,
             payload_json={},

@@ -12,7 +12,6 @@ from detection.models import DetectionCandidate, SheetScanRecord
 
 
 SHEET_STATUS_DETECTION_COMPLETE = "detection_complete"
-SHEET_STATUS_DETECTION_REVIEW_REQUIRED = "detection_review_required"
 SHEET_STATUS_INGESTED = "ingested"
 
 
@@ -100,18 +99,10 @@ def replace_detections(
     candidates: Iterable[DetectionCandidate],
     detection_method: str,
     pipeline_version: str,
-    review_required: bool,
-    review_reason: str | None,
-    preview_path: str | None,
     ocr_request_reason: str | None = None,
 ) -> int:
     """Replace the detection rows for a sheet scan."""
     candidate_list = list(candidates)
-    status = (
-        SHEET_STATUS_DETECTION_REVIEW_REQUIRED
-        if review_required
-        else SHEET_STATUS_DETECTION_COMPLETE
-    )
 
     with conn.cursor() as cur:
         cur.execute(
@@ -192,7 +183,7 @@ def replace_detections(
                     candidate.ocr_text,
                     candidate.ocr_engine if candidate.region_type == "text" else None,
                     candidate.ocr_confidence,
-                    not review_required,
+                    True,
                 ),
             )
             detection_row = cur.fetchone()
@@ -235,34 +226,8 @@ def replace_detections(
                 updated_at = NOW()
             WHERE id = %s
             """,
-            (status, sheet_scan_id),
+            (SHEET_STATUS_DETECTION_COMPLETE, sheet_scan_id),
         )
-
-        if review_required:
-            cur.execute(
-                """
-                INSERT INTO review_tasks (
-                    entity_type,
-                    entity_id,
-                    task_type,
-                    status,
-                    priority,
-                    payload_json
-                )
-                VALUES ('sheet_scan', %s, 'review_detection', 'open', %s, %s::jsonb)
-                """,
-                (
-                    sheet_scan_id,
-                    10,
-                    json.dumps(
-                        {
-                            "review_reason": review_reason,
-                            "preview_path": preview_path,
-                            "candidate_count": len(candidate_list),
-                        }
-                    ),
-                ),
-            )
 
         if ocr_request_reason is not None:
             cur.execute(

@@ -32,18 +32,14 @@ from frame_export.service import (
 )
 from ingest.service import run_ingest
 from orientation.service import run_orientation
-from pipeline.service import run_batch, run_process, run_review_slice, run_until_review
+from pipeline.service import run_batch, run_process, run_until_review
 from pipeline.types import CommandPlan
 from review.service import (
-    accept_detections,
     apply_orientation_review,
-    add_manual_detection,
     dismiss_ocr_reviews,
     export_ocr_text,
     get_next_task,
-    get_sheet_backlog,
     get_task,
-    list_sheet_tasks,
     list_tasks,
     resolve_export_audit_review,
     resolve_task,
@@ -57,7 +53,6 @@ STATUS_TRACKED_COMMANDS = {
     "detect",
     "process",
     "run-batch",
-    "run-next-slice",
     "run-until-review",
     "crop",
     "deskew",
@@ -233,30 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable OCR during detection. Disabled by default.",
     )
 
-    run_next_slice_parser = subparsers.add_parser(
-        "run-next-slice",
-        help="Advance the next unresolved sheet-review slice through staging CSV generation.",
-    )
-    _add_dry_run_argument(run_next_slice_parser)
-    run_next_slice_parser.add_argument("--batch", required=True, help="Batch name to process.")
-    run_next_slice_parser.add_argument(
-        "--limit",
-        type=int,
-        default=20,
-        help="Maximum number of open sheet review tasks to advance.",
-    )
     run_until_review_parser = subparsers.add_parser(
         "run-until-review",
-        help="Keep processing one batch until a true blocker or a fresh staging CSV handoff appears.",
+        help="Keep processing one batch until completion or a true blocker.",
     )
     _add_dry_run_argument(run_until_review_parser)
     run_until_review_parser.add_argument("--batch", required=True, help="Batch name to process.")
-    run_until_review_parser.add_argument(
-        "--review-slice-limit",
-        type=int,
-        default=100,
-        help="Maximum number of open sheet review tasks to advance per slice.",
-    )
     run_until_review_parser.add_argument(
         "--fast",
         action="store_true",
@@ -376,7 +353,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dry_run_argument(review_list)
     review_list.add_argument(
         "--task-type",
-        choices=["review_detection", "review_ocr", "review_orientation", "review_export_audit"],
+        choices=["review_ocr", "review_orientation", "review_export_audit"],
         help="Optional filter for a specific review task type.",
     )
     review_list.add_argument(
@@ -394,7 +371,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dry_run_argument(review_next)
     review_next.add_argument(
         "--task-type",
-        choices=["review_detection", "review_ocr", "review_orientation", "review_export_audit"],
+        choices=["review_ocr", "review_orientation", "review_export_audit"],
         help="Optional filter for a specific review task type.",
     )
     review_show = review_subparsers.add_parser(
@@ -409,20 +386,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_dry_run_argument(review_export_ocr)
     review_export_ocr.add_argument("--task-id", required=True, type=int)
-    review_accept_detection = review_subparsers.add_parser(
-        "accept-detection",
-        help="Accept selected detections for a sheet-level review task.",
-    )
-    _add_dry_run_argument(review_accept_detection)
-    review_accept_detection.add_argument("--task-id", required=True, type=int)
-    review_accept_detection.add_argument(
-        "--detection-id",
-        required=True,
-        type=int,
-        action="append",
-        help="Detection id to accept. Repeat for multiple detections.",
-    )
-    review_accept_detection.add_argument("--note", help="Optional reviewer note.")
     review_set_orientation = review_subparsers.add_parser(
         "set-orientation",
         help="Apply a manual orientation choice for a review_orientation task.",
@@ -448,22 +411,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["accepted", "fix_rotation", "fix_crop", "exclude", "defer"],
     )
     review_resolve_export_audit.add_argument("--note", help="Optional reviewer note.")
-    review_add_detection = review_subparsers.add_parser(
-        "add-detection",
-        help="Create a manual detection for a sheet-level review task.",
-    )
-    _add_dry_run_argument(review_add_detection)
-    review_add_detection.add_argument("--task-id", required=True, type=int)
-    review_add_detection.add_argument(
-        "--region-type",
-        required=True,
-        choices=["photo", "text"],
-        help="Region type for the manual detection.",
-    )
-    review_add_detection.add_argument("--x1", required=True, type=int)
-    review_add_detection.add_argument("--y1", required=True, type=int)
-    review_add_detection.add_argument("--x2", required=True, type=int)
-    review_add_detection.add_argument("--y2", required=True, type=int)
     review_resolve = review_subparsers.add_parser("resolve", help="Resolve a review task placeholder.")
     _add_dry_run_argument(review_resolve)
     review_resolve.add_argument("--task-id", required=True, type=int)
@@ -473,40 +420,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--dismiss",
         action="store_true",
         help="Dismiss the review task instead of resolving it.",
-    )
-    review_sheets = review_subparsers.add_parser(
-        "sheets",
-        help="List unresolved sheet-level review cases with preview paths.",
-    )
-    _add_dry_run_argument(review_sheets)
-    review_sheets.add_argument(
-        "--status",
-        choices=["open", "in_progress", "resolved", "dismissed"],
-        help="Optional filter for task status.",
-    )
-    review_sheets.add_argument(
-        "--limit",
-        type=int,
-        default=25,
-        help="Maximum number of sheet review tasks to show.",
-    )
-    review_backlog = review_subparsers.add_parser(
-        "backlog",
-        help="Show batch-level sheet status counts and unresolved review tasks.",
-    )
-    _add_dry_run_argument(review_backlog)
-    review_backlog.add_argument("--batch", help="Optional batch name filter.")
-    review_backlog.add_argument(
-        "--status",
-        choices=["open", "in_progress", "resolved", "dismissed"],
-        default="open",
-        help="Review task status to list.",
-    )
-    review_backlog.add_argument(
-        "--limit",
-        type=int,
-        default=25,
-        help="Maximum number of review tasks to show.",
     )
     review_dismiss_ocr = review_subparsers.add_parser(
         "dismiss-ocr",
@@ -634,19 +547,10 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             dry_run=args.dry_run,
         )
         return 0
-    if args.command == "run-next-slice":
-        _handle_run_next_slice(
-            config,
-            batch_name=args.batch,
-            limit=args.limit,
-            dry_run=args.dry_run,
-        )
-        return 0
     if args.command == "run-until-review":
         _handle_run_until_review(
             config,
             batch_name=args.batch,
-            review_slice_limit=args.review_slice_limit,
             fast_mode=args.fast,
             enable_ocr=args.ocr,
             dry_run=args.dry_run,
@@ -807,7 +711,6 @@ def _handle_detect(
     print(f"ocr_enabled={str(enable_ocr).lower()}")
     print(f"processed_count={result.processed_count}")
     print(f"detected_count={result.detected_count}")
-    print(f"review_required_count={result.review_required_count}")
 
 
 def _handle_process(
@@ -836,7 +739,6 @@ def _handle_process(
     print(f"ocr_enabled={str(enable_ocr).lower()}")
     print(f"sheets_processed={result.sheets_processed}")
     print(f"photos_processed={result.photos_processed}")
-    print(f"review_required_sheets={result.review_required_sheets}")
 
 
 def _handle_run_batch(
@@ -882,7 +784,6 @@ def _handle_run_batch(
     print(f"ocr_enabled={str(enable_ocr).lower()}")
     print(f"sheets_processed={result.sheets_processed}")
     print(f"photos_processed={result.photos_processed}")
-    print(f"review_required_sheets={result.review_required_sheets}")
     print(f"exported_count={result.exported_count}")
     if result.exported_count > 0:
         print(f"staging_csv_path={config.photos_root / 'exports' / 'staging' / 'export_audit.csv'}")
@@ -902,51 +803,10 @@ def _handle_run_batch(
     _print_run_batch_next_actions(result.blocking_task.task_type)
 
 
-def _handle_run_next_slice(
-    config: AppConfig,
-    *,
-    batch_name: str,
-    limit: int,
-    dry_run: bool,
-) -> None:
-    if dry_run:
-        _print_plan(
-            CommandPlan(
-                command_name="run-next-slice",
-                target=batch_name,
-                dry_run=True,
-                notes=(
-                    f"limit={limit}",
-                    "accept the next open review_detection tasks that already have photo detections",
-                    "run crop, deskew, orient, enhance, export-frame into staging, and refresh the staging CSV",
-                ),
-            )
-        )
-        return
-
-    result = run_review_slice(
-        config,
-        batch_name=batch_name,
-        limit=limit,
-        dry_run=False,
-    )
-    print("command=run-next-slice")
-    print(f"target={result.target}")
-    print(f"dry_run={str(result.dry_run).lower()}")
-    print(f"requested_tasks={result.requested_tasks}")
-    print(f"actionable_tasks={result.actionable_tasks}")
-    print(f"skipped_tasks_without_photo_detections={result.skipped_tasks_without_photo_detections}")
-    print(f"photos_processed={result.photos_processed}")
-    print(f"staged_photo_count={result.staged_photo_count}")
-    print(f"staging_csv_path={result.staging_csv_path}")
-    print("next_action=review only photos/exports/staging/export_audit.csv")
-
-
 def _handle_run_until_review(
     config: AppConfig,
     *,
     batch_name: str,
-    review_slice_limit: int,
     fast_mode: bool,
     enable_ocr: bool,
     dry_run: bool,
@@ -958,11 +818,9 @@ def _handle_run_until_review(
                 target=batch_name,
                 dry_run=True,
                 notes=(
-                    f"review_slice_limit={review_slice_limit}",
                     f"fast_mode={str(fast_mode).lower()}",
                     f"ocr_enabled={str(enable_ocr).lower()}",
-                    "keep processing ingested sheets and auto-advancing actionable review slices",
-                    "stop only at a fresh staging CSV handoff or a true non-actionable blocker",
+                    "keep processing ingested sheets until the batch reaches staging review or a true blocker",
                 ),
             )
         )
@@ -972,7 +830,6 @@ def _handle_run_until_review(
         config,
         batch_name=batch_name,
         fast_mode=fast_mode,
-        review_slice_limit=review_slice_limit,
         enable_ocr=enable_ocr,
         dry_run=False,
     )
@@ -981,9 +838,7 @@ def _handle_run_until_review(
     print(f"dry_run={str(result.dry_run).lower()}")
     print(f"ocr_enabled={str(enable_ocr).lower()}")
     print(f"batch_runs={result.batch_runs}")
-    print(f"review_slice_runs={result.review_slice_runs}")
     print(f"pending_sheets={result.pending_sheets}")
-    print(f"open_sheet_tasks={result.open_sheet_tasks}")
     print(f"staged_photo_count={result.staged_photo_count}")
     print(f"blocked={str(result.blocked).lower()}")
     if result.blocked_reason is not None:
@@ -1252,64 +1107,6 @@ def _handle_promote_exports(
 
 
 def _handle_review(config: AppConfig, args: argparse.Namespace, dry_run: bool) -> None:
-    if args.review_command == "sheets":
-        if dry_run:
-            _print_plan(
-                CommandPlan(
-                    command_name="review sheets",
-                    target="sheet_review_queue",
-                    dry_run=True,
-                    notes=("dry-run does not query the database",),
-                )
-            )
-            return
-        tasks = list_sheet_tasks(
-            config,
-            status=args.status or "open",
-            limit=args.limit,
-        )
-        if not tasks:
-            print("sheet_review_tasks=none")
-            return
-        print("id\tstatus\tpriority\tsheet_id\treason\tpreview_path")
-        for task in tasks:
-            print(
-                f"{task.id}\t{task.status}\t{task.priority}\t{task.entity_id}\t"
-                f"{task.payload_json.get('review_reason', '')}\t"
-                f"{task.payload_json.get('preview_path', '')}"
-            )
-        return
-    if args.review_command == "backlog":
-        if dry_run:
-            _print_plan(
-                CommandPlan(
-                    command_name="review backlog",
-                    target=args.batch or "all_batches",
-                    dry_run=True,
-                    notes=("dry-run does not query the database",),
-                )
-            )
-            return
-        backlog = get_sheet_backlog(
-            config,
-            batch_name=args.batch,
-            status=args.status,
-            limit=args.limit,
-        )
-        print(f"batch={backlog.batch_name or 'all'}")
-        for sheet_status, count in backlog.sheet_status_counts.items():
-            print(f"sheet_status_count={sheet_status}:{count}")
-        if not backlog.open_tasks:
-            print("sheet_review_tasks=none")
-            return
-        print("id\tstatus\tpriority\tsheet_id\treason\tpreview_path")
-        for task in backlog.open_tasks:
-            print(
-                f"{task.id}\t{task.status}\t{task.priority}\t{task.entity_id}\t"
-                f"{task.payload_json.get('review_reason', '')}\t"
-                f"{task.payload_json.get('preview_path', '')}"
-            )
-        return
     if args.review_command == "list":
         if dry_run:
             _print_plan(
@@ -1461,42 +1258,6 @@ def _handle_review(config: AppConfig, args: argparse.Namespace, dry_run: bool) -
         print(f"task_id={args.task_id}")
         print(f"output_path={output_path}")
         return
-    if args.review_command == "accept-detection":
-        if dry_run:
-            _print_plan(
-                CommandPlan(
-                    command_name="review accept-detection",
-                    target=f"task_id={args.task_id}",
-                    dry_run=True,
-                    notes=(f"detection_ids={','.join(str(value) for value in args.detection_id)}",),
-                )
-            )
-            return
-        task = accept_detections(
-            config,
-            task_id=args.task_id,
-            detection_ids=args.detection_id,
-            note=args.note,
-        )
-        print(f"task_id={task.id}")
-        print(f"task_type={task.task_type}")
-        print(f"status={task.status}")
-        return
-    if args.review_command == "add-detection":
-        output_path = add_manual_detection(
-            config,
-            task_id=args.task_id,
-            region_type=args.region_type,
-            x1=args.x1,
-            y1=args.y1,
-            x2=args.x2,
-            y2=args.y2,
-            dry_run=dry_run,
-        )
-        print(f"task_id={args.task_id}")
-        print(f"dry_run={str(dry_run).lower()}")
-        print(f"output_path={output_path}")
-        return
     if args.review_command == "resolve":
         if dry_run:
             _print_plan(
@@ -1554,12 +1315,11 @@ def _print_run_batch_review_summary(task_counts: dict[str, int]) -> None:
         return
 
     category_by_task_type = {
-        "review_detection": "crop_detection",
         "review_orientation": "rotation",
         "review_ocr": "ocr",
         "review_export_audit": "export_audit",
     }
-    ordered_task_types = ("review_detection", "review_orientation", "review_ocr", "review_export_audit")
+    ordered_task_types = ("review_orientation", "review_ocr", "review_export_audit")
     remaining_task_types = sorted(
         task_type for task_type in task_counts if task_type not in ordered_task_types
     )
@@ -1572,13 +1332,6 @@ def _print_run_batch_review_summary(task_counts: dict[str, int]) -> None:
 
 
 def _print_run_batch_next_actions(task_type: str) -> None:
-    if task_type == "review_detection":
-        print("next_action=review sheet-level crop/detection issue")
-        print("next_command=PYTHONPATH=src python3 -m cli review show --task-id <task_id>")
-        print(
-            "followup_command=PYTHONPATH=src python3 -m cli review accept-detection --task-id <task_id> --detection-id <detection_id>"
-        )
-        return
     if task_type == "review_orientation":
         print("next_action=review rotation issue")
         print("next_command=PYTHONPATH=src python3 -m cli review show --task-id <task_id>")

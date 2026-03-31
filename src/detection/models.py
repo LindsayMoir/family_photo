@@ -44,9 +44,6 @@ class SheetDetectionResult:
 
     sheet_scan_id: int
     detection_count: int
-    review_required: bool
-    review_reason: str | None
-    preview_path: Path | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,5 +53,4 @@ class DetectionRunSummary:
     target: str
     processed_count: int
     detected_count: int
-    review_required_count: int
     dry_run: bool

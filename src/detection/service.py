@@ -9,7 +9,6 @@ from config import AppConfig
 from db.connection import connect
 from detection.analysis import (
     detect_sheet_regions,
-    has_duplicate_wide_photo_candidate,
     render_detection_preview,
     write_candidate_crop,
 )
@@ -52,7 +51,6 @@ def run_detection(
 
     detection_results: list[SheetDetectionResult] = []
     total_candidates = 0
-    review_required_count = 0
 
     if dry_run:
         for sheet in sheets:
@@ -67,23 +65,13 @@ def run_detection(
                 analysis_result.candidates,
                 write_files=False,
             )
-            review_required, review_reason = _review_decision(
-                sheet,
-                candidates,
-                image_path=sheet.original_path,
-            )
-            preview_path = _preview_path(config.photos_root, sheet) if review_required else None
             detection_results.append(
                 SheetDetectionResult(
                     sheet_scan_id=sheet.id,
                     detection_count=len(candidates),
-                    review_required=review_required,
-                    review_reason=review_reason,
-                    preview_path=preview_path,
                 )
             )
             total_candidates += len(candidates)
-            review_required_count += int(review_required)
     else:
         with connect(config) as conn:
             for sheet in sheets:
@@ -99,14 +87,7 @@ def run_detection(
                     analysis_result.candidates,
                     write_files=True,
                 )
-                review_required, review_reason = _review_decision(
-                    sheet,
-                    candidates,
-                    image_path=sheet.original_path,
-                )
-                preview_path: Path | None = None
-
-                preview_path = render_detection_preview(
+                render_detection_preview(
                     sheet.original_path,
                     candidates,
                     _preview_path(config.photos_root, sheet),
@@ -118,22 +99,15 @@ def run_detection(
                     candidates=candidates,
                     detection_method=DETECTION_METHOD,
                     pipeline_version=PIPELINE_VERSION,
-                    review_required=review_required,
-                    review_reason=review_reason,
-                    preview_path=str(preview_path) if preview_path is not None else None,
                     ocr_request_reason=analysis_result.ocr_request_reason,
                 )
                 detection_results.append(
                     SheetDetectionResult(
                         sheet_scan_id=sheet.id,
                         detection_count=detection_count,
-                        review_required=review_required,
-                        review_reason=review_reason,
-                        preview_path=preview_path,
                     )
                 )
                 total_candidates += detection_count
-                review_required_count += int(review_required)
             conn.commit()
 
     target = batch_name if batch_name is not None else f"sheet_id={sheet_id}"
@@ -141,58 +115,8 @@ def run_detection(
         target=target,
         processed_count=len(detection_results),
         detected_count=total_candidates,
-        review_required_count=review_required_count,
         dry_run=dry_run,
     )
-
-
-def _review_decision(
-    sheet: SheetScanRecord,
-    candidates: list[DetectionCandidate],
-    *,
-    image_path: Path,
-) -> tuple[bool, str | None]:
-    candidate_count = len(candidates)
-    if candidate_count == 0:
-        return True, "no_candidates"
-    photo_candidates = [candidate for candidate in candidates if candidate.region_type == "photo"]
-    photo_count = len(photo_candidates)
-    if photo_count > 6:
-        return True, "too_many_photo_candidates"
-    if _has_suspicious_overlapping_photos(photo_candidates):
-        return True, "suspicious_overlapping_photo_candidates"
-    if _has_suspicious_wide_photo_candidate(sheet, photo_candidates):
-        return True, "suspicious_wide_photo_candidate"
-    if has_duplicate_wide_photo_candidate(image_path, photo_candidates):
-        return True, "duplicate_wide_photo_candidate"
-    if any(candidate.confidence < 0.60 for candidate in candidates):
-        return True, "low_confidence_candidates"
-    return False, None
-
-
-def _has_suspicious_overlapping_photos(photo_candidates: list[DetectionCandidate]) -> bool:
-    for index, left in enumerate(photo_candidates):
-        for right in photo_candidates[index + 1 :]:
-            overlap_ratio = _intersection_over_smaller_area(left, right)
-            if overlap_ratio >= 0.22:
-                return True
-    return False
-
-
-def _has_suspicious_wide_photo_candidate(
-    sheet: SheetScanRecord,
-    photo_candidates: list[DetectionCandidate],
-) -> bool:
-    if len(photo_candidates) < 3:
-        return False
-
-    for candidate in photo_candidates:
-        x1, y1, x2, y2 = _bounds(candidate.box_points)
-        width_ratio = (x2 - x1) / float(sheet.width_px)
-        height_ratio = (y2 - y1) / float(sheet.height_px)
-        if width_ratio >= 0.82 and height_ratio <= 0.40 and candidate.area_ratio >= 0.18:
-            return True
-    return False
 
 
 def _preview_path(photos_root: Path, sheet: SheetScanRecord) -> Path:

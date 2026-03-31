@@ -19,26 +19,6 @@ class ReviewTask:
 
 
 @dataclass(frozen=True, slots=True)
-class DetectionReviewCandidate:
-    """A detection candidate attached to a sheet-level review task."""
-
-    id: int
-    region_type: str
-    confidence: float
-    accepted: bool
-    crop_path: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class SheetReviewBacklog:
-    """Batch-level review backlog summary."""
-
-    batch_name: str | None
-    sheet_status_counts: dict[str, int]
-    open_tasks: list[ReviewTask]
-
-
-@dataclass(frozen=True, slots=True)
 class ReviewTaskSummary:
     """Counts of open review work grouped by task type."""
 
