@@ -1,0 +1,7 @@
+model = "gpt-5.4"
+
+approval_policy = "never"
+sandbox_mode = "workspace-write"
+
+[sandbox_workspace_write]
+network_access = true
