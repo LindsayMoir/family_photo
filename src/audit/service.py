@@ -5,22 +5,38 @@ from __future__ import annotations
 import csv
 from collections import Counter, defaultdict
 from pathlib import Path
+import re
 from typing import Any
 
 import cv2
 
+from audit.merge_detection import ExportIssueSuggestion, resolve_export_issues
 from audit.models import ExportAuditFinding, ExportAuditRecord, ExportAuditSummary
 from config import AppConfig
 from db.connection import connect
-from frame_export.service import STAGING_FRAME_EXPORT_ARTIFACT_TYPE, stage_photo_exports
+from frame_export.service import (
+    FRAME_EXPORT_PIPELINE_VERSION,
+    STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+    stage_photo_exports,
+)
 from orientation.service import audit_orientation_image
-from photo_repository import list_export_audit_records, list_open_orientation_review_photo_ids
+from photo_repository import (
+    delete_photo_artifact,
+    insert_photo_artifact,
+    list_export_audit_records,
+    list_open_orientation_review_photo_ids,
+    list_photo_artifact_paths,
+    list_photo_ids,
+)
 
 
 MERGED_SIMILARITY_THRESHOLD = 0.83
 ROTATION_180_CONFIDENCE_THRESHOLD = 0.80
 ROTATION_RIGHT_ANGLE_THRESHOLD = 0.90
 AMBIGUOUS_DETECTION_CONFIDENCE = 0.75
+AUTO_PREFILL_ISSUE_THRESHOLDS: dict[str, float] = {
+    "R180": 0.90,
+}
 ISSUE_CODEBOOK: tuple[tuple[str, str], ...] = (
     ("RR90", "Rotate right 90 degrees."),
     ("RL90", "Rotate left 90 degrees."),
@@ -38,6 +54,7 @@ ISSUE_CODEBOOK: tuple[tuple[str, str], ...] = (
     ("AMBIG", "Source ambiguous, manual judgment required."),
     ("OTHER", "Custom issue. Explain in notes."),
 )
+_STAGING_EXPORT_FILENAME_RE = re.compile(r"^photo_(?P<photo_id>\d+)\.jpg$", re.IGNORECASE)
 
 
 def run_export_audit(
@@ -61,6 +78,16 @@ def run_export_audit(
             limit=limit,
         )
     with connect(config) as conn:
+        if not dry_run:
+            _reconcile_staging_export_artifacts(
+                conn,
+                config,
+                batch_name=batch_name,
+                sheet_id=sheet_id,
+                photo_id=photo_id,
+                limit=limit,
+            )
+            conn.commit()
         records = list_export_audit_records(
             conn,
             artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
@@ -70,7 +97,7 @@ def run_export_audit(
             limit=limit,
         )
 
-    findings = _classify_records(records)
+    findings = _classify_records(records, config=config)
     if category is not None:
         findings = [finding for finding in findings if finding.category == category]
 
@@ -92,16 +119,36 @@ def run_export_audit(
     )
 
 
-def _classify_records(records: list[ExportAuditRecord]) -> list[ExportAuditFinding]:
+def _classify_records(
+    records: list[ExportAuditRecord],
+    *,
+    config: AppConfig,
+) -> list[ExportAuditFinding]:
     by_sheet: dict[int, list[ExportAuditRecord]] = defaultdict(list)
     for record in records:
         by_sheet[record.sheet_scan_id].append(record)
+    classified_rows: list[tuple[ExportAuditRecord, object, str, str]] = []
+    candidate_model_paths: set[Path] = set()
 
-    findings: list[ExportAuditFinding] = []
     for record in records:
         siblings = [candidate for candidate in by_sheet[record.sheet_scan_id] if candidate.photo_id != record.photo_id]
         orientation_decision = audit_orientation_image(record.working_path)
         category, reason = _classify_record(record, siblings, orientation_decision)
+        classified_rows.append((record, orientation_decision, category, reason))
+        if _should_query_model_for_record(category=category, orientation_decision=orientation_decision):
+            candidate_model_paths.add(record.export_path)
+
+    suggestion_by_export_path = resolve_export_issues(
+        config,
+        image_paths=sorted(candidate_model_paths),
+    )
+
+    findings: list[ExportAuditFinding] = []
+    for record, orientation_decision, category, reason in classified_rows:
+        suggestion = _suggested_issue_for_record(
+            category=category,
+            suggestion=suggestion_by_export_path.get(record.export_path),
+        )
         findings.append(
             ExportAuditFinding(
                 photo_id=record.photo_id,
@@ -114,11 +161,108 @@ def _classify_records(records: list[ExportAuditRecord]) -> list[ExportAuditFindi
                 auto_rotation_suggestion=orientation_decision.rotation_degrees,
                 auto_rotation_confidence=orientation_decision.confidence,
                 review_priority=_review_priority_for_category(category, orientation_decision.confidence),
+                suggested_issue=suggestion.issue_code if suggestion is not None and suggestion.issue_code != "OK" else None,
+                suggested_issue_confidence=suggestion.confidence if suggestion is not None and suggestion.issue_code != "OK" else None,
+                suggested_issue_reason=suggestion.reason if suggestion is not None and suggestion.issue_code != "OK" else None,
             )
         )
 
     findings.sort(key=lambda item: (item.category, item.batch_name, item.sheet_scan_id, item.crop_index, item.photo_id))
     return findings
+
+
+def _reconcile_staging_export_artifacts(
+    conn,
+    config: AppConfig,
+    *,
+    batch_name: str | None,
+    sheet_id: int | None,
+    photo_id: int | None,
+    limit: int | None,
+) -> None:
+    allowed_photo_ids = set(
+        list_photo_ids(
+            conn,
+            batch_name=batch_name,
+            sheet_id=sheet_id,
+            photo_id=photo_id,
+            limit=limit,
+        )
+    )
+    if not allowed_photo_ids:
+        return
+    removed_paths: set[tuple[int, Path]] = set()
+
+    for staging_path in _iter_staging_export_paths(config):
+        parsed_photo_id = _photo_id_from_staging_filename(staging_path.name)
+        if parsed_photo_id is None or parsed_photo_id not in allowed_photo_ids:
+            continue
+
+        existing_paths = list_photo_artifact_paths(
+            conn,
+            photo_id=parsed_photo_id,
+            artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+        )
+        for existing_path in existing_paths:
+            if existing_path == staging_path:
+                continue
+            removal_key = (parsed_photo_id, existing_path)
+            if removal_key in removed_paths:
+                continue
+            delete_photo_artifact(
+                conn,
+                photo_id=parsed_photo_id,
+                artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+                path=existing_path,
+            )
+            removed_paths.add(removal_key)
+
+        insert_photo_artifact(
+            conn,
+            photo_id=parsed_photo_id,
+            artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+            path=staging_path,
+            pipeline_stage="frame_export",
+            pipeline_version=FRAME_EXPORT_PIPELINE_VERSION,
+        )
+
+    for allowed_photo_id in allowed_photo_ids:
+        existing_paths = list_photo_artifact_paths(
+            conn,
+            photo_id=allowed_photo_id,
+            artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+        )
+        for existing_path in existing_paths:
+            if existing_path.exists():
+                continue
+            removal_key = (allowed_photo_id, existing_path)
+            if removal_key in removed_paths:
+                continue
+            delete_photo_artifact(
+                conn,
+                photo_id=allowed_photo_id,
+                artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+                path=existing_path,
+            )
+            removed_paths.add(removal_key)
+
+
+def _iter_staging_export_paths(config: AppConfig) -> list[Path]:
+    staging_root = config.photos_root / "exports" / "staging"
+    paths: list[Path] = []
+    for folder_name in ("landscape", "portrait"):
+        folder = staging_root / folder_name
+        if not folder.exists():
+            continue
+        paths.extend(sorted(path for path in folder.iterdir() if path.is_file()))
+    return paths
+
+
+def _photo_id_from_staging_filename(filename: str) -> int | None:
+    match = _STAGING_EXPORT_FILENAME_RE.match(filename)
+    if match is None:
+        return None
+    return int(match.group("photo_id"))
 
 
 def _classify_record(
@@ -142,6 +286,16 @@ def _classify_record(
         return "source_ambiguous", source_reason
 
     return "ok", "no audit issue detected"
+
+
+def _suggested_issue_for_record(
+    *,
+    category: str,
+    suggestion: ExportIssueSuggestion | None,
+) -> ExportIssueSuggestion | None:
+    if suggestion is None or suggestion.issue_code == "OK":
+        return None
+    return suggestion
 
 
 def _stage_open_orientation_reviews(
@@ -174,13 +328,7 @@ def _merged_detection_reason(
         return None
 
     crop_height, crop_width = crop.shape[:2]
-    if crop_width <= crop_height or not siblings:
-        return None
-
-    split_index = crop_width // 2
-    left_half = crop[:, :split_index]
-    right_half = crop[:, split_index:]
-    if left_half.size == 0 or right_half.size == 0:
+    if crop_width <= crop_height:
         return None
 
     if record.detection_width and record.detection_height:
@@ -190,6 +338,15 @@ def _merged_detection_reason(
         )
         if aspect_ratio < 1.4:
             return None
+
+    if not siblings:
+        return None
+
+    split_index = crop_width // 2
+    left_half = crop[:, :split_index]
+    right_half = crop[:, split_index:]
+    if left_half.size == 0 or right_half.size == 0:
+        return None
 
     for sibling in siblings:
         sibling_crop = cv2.imread(str(sibling.raw_crop_path))
@@ -220,6 +377,30 @@ def _review_priority_for_category(category: str, confidence: float) -> str:
     if category == "source_ambiguous":
         return "medium"
     return "low"
+
+
+def _rotation_issue_code(rotation_degrees: int) -> str | None:
+    if rotation_degrees == 90:
+        return "RR90"
+    if rotation_degrees == 180:
+        return "R180"
+    if rotation_degrees == 270:
+        return "RL90"
+    return None
+
+
+def _should_query_model_for_record(
+    *,
+    category: str,
+    orientation_decision,
+) -> bool:
+    if category != "rotation":
+        return False
+    if _rotation_issue_code(orientation_decision.rotation_degrees) != "R180":
+        return False
+    if orientation_decision.confidence < ROTATION_180_CONFIDENCE_THRESHOLD:
+        return False
+    return True
 
 
 def _source_ambiguous_reason(record: ExportAuditRecord) -> str | None:
@@ -272,6 +453,9 @@ def _write_audit_csv(csv_path: Path, findings: list[ExportAuditFinding]) -> None
         "issue",
         "notes",
         "review_priority",
+        "suggested_issue",
+        "suggested_issue_confidence",
+        "suggested_issue_reason",
         "auto_rotation_suggestion",
         "auto_rotation_confidence",
         "audit_category",
@@ -287,15 +471,23 @@ def _write_audit_csv(csv_path: Path, findings: list[ExportAuditFinding]) -> None
         writer.writeheader()
         for finding in sorted_findings:
             preserved = preserved_manual_fields.get(str(finding.photo_id), {})
+            defaults = _default_manual_fields_for_finding(finding)
             writer.writerow(
                 {
                     "row_type": "photo",
                     "export_folder": finding.export_path.parent.name,
                     "export_filename": finding.export_path.name,
-                    "needs_help": preserved.get("needs_help", ""),
-                    "issue": preserved.get("issue", ""),
-                    "notes": preserved.get("notes", ""),
+                    "needs_help": preserved.get("needs_help", defaults["needs_help"]),
+                    "issue": preserved.get("issue", defaults["issue"]),
+                    "notes": preserved.get("notes", defaults["notes"]),
                     "review_priority": finding.review_priority,
+                    "suggested_issue": finding.suggested_issue or "",
+                    "suggested_issue_confidence": (
+                        f"{finding.suggested_issue_confidence:.2f}"
+                        if finding.suggested_issue_confidence is not None
+                        else ""
+                    ),
+                    "suggested_issue_reason": finding.suggested_issue_reason or "",
                     "auto_rotation_suggestion": finding.auto_rotation_suggestion,
                     "auto_rotation_confidence": f"{finding.auto_rotation_confidence:.2f}",
                     "audit_category": finding.category,
@@ -337,3 +529,26 @@ def _load_existing_manual_fields(csv_path: Path) -> dict[str, dict[str, str]]:
                 "notes": row.get("notes", row.get("operator_notes", "")),
             }
     return manual_fields
+
+
+def _default_manual_fields_for_finding(finding: ExportAuditFinding) -> dict[str, str]:
+    if _should_auto_prefill_issue(finding):
+        return {
+            "needs_help": "x",
+            "issue": finding.suggested_issue or "",
+            "notes": "",
+        }
+    return {
+        "needs_help": "",
+        "issue": "",
+        "notes": "",
+    }
+
+
+def _should_auto_prefill_issue(finding: ExportAuditFinding) -> bool:
+    if finding.suggested_issue is None or finding.suggested_issue_confidence is None:
+        return False
+    threshold = AUTO_PREFILL_ISSUE_THRESHOLDS.get(finding.suggested_issue)
+    if threshold is None:
+        return False
+    return finding.suggested_issue_confidence >= threshold

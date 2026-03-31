@@ -42,6 +42,9 @@ class ExportAuditFinding:
     auto_rotation_suggestion: int
     auto_rotation_confidence: float
     review_priority: str
+    suggested_issue: str | None
+    suggested_issue_confidence: float | None
+    suggested_issue_reason: str | None
 
 
 @dataclass(frozen=True, slots=True)

@@ -15,6 +15,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from app_logging import configure_logging
+from audit.eval_service import run_audit_model_trial
 from audit.import_service import import_audit_csv
 from audit.service import run_export_audit
 from config import AppConfig, ConfigError, load_config
@@ -60,6 +61,7 @@ STATUS_TRACKED_COMMANDS = {
     "enhance",
     "export-frame",
     "audit-exports",
+    "audit-model-trial",
     "import-audit-csv",
     "promote-exports",
 }
@@ -333,6 +335,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--csv-path",
         type=Path,
         help="CSV path to import. Defaults to photos/exports/staging/export_audit.csv.",
+    )
+    audit_model_trial_parser = subparsers.add_parser(
+        "audit-model-trial",
+        help="Run a non-destructive comparison between manual audit labels and model suggestions.",
+    )
+    _add_dry_run_argument(audit_model_trial_parser)
+    audit_model_trial_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="CSV path to evaluate. Defaults to photos/exports/staging/export_audit.csv.",
+    )
+    audit_model_trial_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of manually labeled rows to evaluate. Defaults to 20.",
+    )
+    audit_model_trial_parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Optional output directory for the before/after trial set.",
     )
 
     promote_exports_parser = subparsers.add_parser(
@@ -612,6 +635,15 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
         _handle_import_audit_csv(
             config,
             csv_path=args.csv_path,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "audit-model-trial":
+        _handle_audit_model_trial(
+            config,
+            csv_path=args.csv_path,
+            limit=args.limit,
+            output_dir=args.output_dir,
             dry_run=args.dry_run,
         )
         return 0
@@ -1070,6 +1102,48 @@ def _handle_import_audit_csv(
     print(f"auto_fixed_count={result.auto_fixed_count}")
     print(f"auto_fix_unresolved_count={result.auto_fix_unresolved_count}")
     print(f"created_photo_count={result.created_photo_count}")
+
+
+def _handle_audit_model_trial(
+    config: AppConfig,
+    *,
+    csv_path: Path | None,
+    limit: int,
+    output_dir: Path | None,
+    dry_run: bool,
+) -> None:
+    resolved_csv_path = (
+        csv_path
+        if csv_path is not None
+        else config.photos_root / "exports" / "staging" / "export_audit.csv"
+    )
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="audit-model-trial",
+                target=str(resolved_csv_path),
+                dry_run=True,
+                notes=(
+                    f"evaluate up to {limit} manually labeled staged exports using the vision model",
+                    "write before/manual_expected/model_predicted folders without changing live staging",
+                ),
+            )
+        )
+        return
+
+    result = run_audit_model_trial(
+        config,
+        csv_path=resolved_csv_path,
+        limit=limit,
+        output_dir=output_dir,
+        dry_run=False,
+    )
+    print("command=audit-model-trial")
+    print(f"csv_path={result.csv_path}")
+    print(f"output_dir={result.output_dir}")
+    print(f"evaluated_count={result.evaluated_count}")
+    print(f"agreement_count={result.agreement_count}")
+    print(f"dry_run={str(result.dry_run).lower()}")
 
 
 def _handle_promote_exports(
