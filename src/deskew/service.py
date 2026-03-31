@@ -30,10 +30,30 @@ class DeskewSummary:
 
 def run_deskew(config: AppConfig, *, photo_id: int, dry_run: bool) -> DeskewSummary:
     """Estimate and apply a small-angle deskew correction."""
+    return run_deskew_with_override(
+        config,
+        photo_id=photo_id,
+        forced_angle=None,
+        dry_run=dry_run,
+    )
+
+
+def run_deskew_with_override(
+    config: AppConfig,
+    *,
+    photo_id: int,
+    forced_angle: float | None,
+    dry_run: bool,
+) -> DeskewSummary:
+    """Estimate and apply a small-angle deskew correction, optionally forcing the angle."""
     with connect(config) as conn:
         photo = get_photo_record(conn, photo_id=photo_id)
 
-    angle, confidence = _estimate_deskew(photo.working_path)
+    if forced_angle is None:
+        angle, confidence = _estimate_deskew(photo.working_path)
+    else:
+        angle = round(forced_angle, 4)
+        confidence = 1.0
     output_path = _deskew_output_path(config.photos_root, photo_id)
 
     if dry_run:
@@ -118,4 +138,3 @@ def _write_deskewed_image(input_path: Path, output_path: Path, angle: float) -> 
 
 def _deskew_output_path(photos_root: Path, photo_id: int) -> Path:
     return photos_root / "derivatives" / "deskew" / f"photo_{photo_id}.jpg"
-

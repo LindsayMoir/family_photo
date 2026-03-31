@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 from psycopg2.extensions import connection as PgConnection
 
+from audit.models import ExportAuditRecord
 from photo_models import PhotoRecord
 
 
@@ -109,6 +111,153 @@ def list_export_ready_photo_ids(
         JOIN sheet_scans ss ON ss.id = p.sheet_scan_id
         JOIN scan_batches sb ON sb.id = ss.scan_batch_id
         WHERE 1 = 1
+    """
+    if batch_name is not None:
+        clauses.append("sb.name = %s")
+        params.append(batch_name)
+    if sheet_id is not None:
+        clauses.append("p.sheet_scan_id = %s")
+        params.append(sheet_id)
+    if photo_id is not None:
+        clauses.append("p.id = %s")
+        params.append(photo_id)
+    query += " AND " + " AND ".join(clauses)
+    query += " ORDER BY p.id"
+    if limit is not None:
+        query += " LIMIT %s"
+        params.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+    return [int(row[0]) for row in rows]
+
+
+def list_export_audit_records(
+    conn: PgConnection,
+    *,
+    artifact_type: str,
+    batch_name: str | None = None,
+    sheet_id: int | None = None,
+    photo_id: int | None = None,
+    limit: int | None = None,
+) -> list[ExportAuditRecord]:
+    """Return exported photo records with the metadata needed for audit classification."""
+    clauses: list[str] = ["pa.artifact_type = %s"]
+    params: list[object] = []
+    params.append(artifact_type)
+
+    query = """
+        SELECT
+            p.id,
+            sb.name,
+            p.sheet_scan_id,
+            p.crop_index,
+            p.raw_crop_path,
+            p.working_path,
+            pa.path,
+            p.status,
+            p.rotation_degrees,
+            p.accepted_detection_id,
+            pd.confidence,
+            pd.reviewed_by_human,
+            COALESCE(pd.bbox_json->>'width', NULL),
+            COALESCE(pd.bbox_json->>'height', NULL),
+            CASE WHEN rt.id IS NULL THEN FALSE ELSE TRUE END,
+            rt.payload_json
+        FROM photos p
+        JOIN sheet_scans ss ON ss.id = p.sheet_scan_id
+        JOIN scan_batches sb ON sb.id = ss.scan_batch_id
+        JOIN photo_artifacts pa ON pa.photo_id = p.id
+        LEFT JOIN photo_detections pd ON pd.id = p.accepted_detection_id
+        LEFT JOIN review_tasks rt
+            ON rt.entity_type = 'photo'
+           AND rt.entity_id = p.id
+           AND rt.task_type = 'review_orientation'
+           AND rt.status = 'open'
+        WHERE 1 = 1
+    """
+    if batch_name is not None:
+        clauses.append("sb.name = %s")
+        params.append(batch_name)
+    if sheet_id is not None:
+        clauses.append("p.sheet_scan_id = %s")
+        params.append(sheet_id)
+    if photo_id is not None:
+        clauses.append("p.id = %s")
+        params.append(photo_id)
+    query += " AND " + " AND ".join(clauses)
+    query += " ORDER BY p.id"
+    if limit is not None:
+        query += " LIMIT %s"
+        params.append(limit)
+
+    with conn.cursor() as cur:
+        cur.execute(query, tuple(params))
+        rows = cur.fetchall()
+
+    records: list[ExportAuditRecord] = []
+    for row in rows:
+        payload = row[15]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if payload is None:
+            payload = {}
+        suggested_rotation = payload.get("suggested_rotation")
+        confidence = payload.get("confidence")
+        orientation_review_reason = None
+        if suggested_rotation is not None:
+            confidence_suffix = ""
+            if confidence is not None:
+                confidence_suffix = f" at confidence {float(confidence):.2f}"
+            orientation_review_reason = (
+                f"open orientation review suggests {int(suggested_rotation)} degree correction"
+                f"{confidence_suffix}"
+            )
+        records.append(
+            ExportAuditRecord(
+                photo_id=int(row[0]),
+                batch_name=str(row[1]),
+                sheet_scan_id=int(row[2]),
+                crop_index=int(row[3]),
+                raw_crop_path=Path(str(row[4])),
+                working_path=Path(str(row[5])),
+                export_path=Path(str(row[6])),
+                status=str(row[7]),
+                rotation_degrees=int(row[8]) if row[8] is not None else None,
+                accepted_detection_id=int(row[9]) if row[9] is not None else None,
+                detection_confidence=float(row[10]) if row[10] is not None else None,
+                detection_reviewed_by_human=bool(row[11]) if row[11] is not None else False,
+                detection_width=float(row[12]) if row[12] is not None else None,
+                detection_height=float(row[13]) if row[13] is not None else None,
+                has_open_orientation_review=bool(row[14]),
+                orientation_review_reason=orientation_review_reason,
+            )
+        )
+    return records
+
+
+def list_open_orientation_review_photo_ids(
+    conn: PgConnection,
+    *,
+    batch_name: str | None = None,
+    sheet_id: int | None = None,
+    photo_id: int | None = None,
+    limit: int | None = None,
+) -> list[int]:
+    """Return photo ids with open orientation review tasks."""
+    clauses: list[str] = [
+        "rt.task_type = 'review_orientation'",
+        "rt.status = 'open'",
+    ]
+    params: list[object] = []
+    query = """
+        SELECT p.id
+        FROM review_tasks rt
+        JOIN photos p ON p.id = rt.entity_id
+        JOIN sheet_scans ss ON ss.id = p.sheet_scan_id
+        JOIN scan_batches sb ON sb.id = ss.scan_batch_id
+        WHERE rt.entity_type = 'photo'
     """
     if batch_name is not None:
         clauses.append("sb.name = %s")

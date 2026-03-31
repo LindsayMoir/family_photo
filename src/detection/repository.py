@@ -13,6 +13,7 @@ from detection.models import DetectionCandidate, SheetScanRecord
 
 SHEET_STATUS_DETECTION_COMPLETE = "detection_complete"
 SHEET_STATUS_DETECTION_REVIEW_REQUIRED = "detection_review_required"
+SHEET_STATUS_INGESTED = "ingested"
 
 
 def get_sheet_scans(
@@ -21,10 +22,13 @@ def get_sheet_scans(
     batch_name: str | None = None,
     sheet_id: int | None = None,
     limit: int | None = None,
+    pending_only: bool = False,
 ) -> list[SheetScanRecord]:
     """Fetch sheet scans by batch or single id."""
     if batch_name is None and sheet_id is None:
         raise ValueError("Either batch_name or sheet_id must be provided.")
+    if pending_only and sheet_id is not None:
+        raise ValueError("pending_only cannot be used with an explicit sheet_id.")
 
     clauses: list[str] = []
     params: list[object] = []
@@ -35,6 +39,9 @@ def get_sheet_scans(
     if sheet_id is not None:
         clauses.append("ss.id = %s")
         params.append(sheet_id)
+    if pending_only:
+        clauses.append("ss.status = %s")
+        params.append(SHEET_STATUS_INGESTED)
 
     query = """
         SELECT ss.id, sb.name, ss.original_path, ss.width_px, ss.height_px
@@ -62,6 +69,28 @@ def get_sheet_scans(
         )
         for row in rows
     ]
+
+
+def count_sheet_scans_by_status(
+    conn: PgConnection,
+    *,
+    batch_name: str,
+    status: str,
+) -> int:
+    """Count sheet scans in one batch with a specific status."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT COUNT(*)
+            FROM sheet_scans ss
+            JOIN scan_batches sb ON sb.id = ss.scan_batch_id
+            WHERE sb.name = %s
+              AND ss.status = %s
+            """,
+            (batch_name, status),
+        )
+        row = cur.fetchone()
+    return int(row[0]) if row is not None else 0
 
 
 def replace_detections(

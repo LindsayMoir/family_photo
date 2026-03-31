@@ -23,6 +23,9 @@ The system is intended to:
 The recommended MVP is a single Python CLI application with a staged processing pipeline and human review checkpoints. The pipeline should preserve original scans, produce deterministic derived artifacts, and persist provenance and review state in PostgreSQL.
 
 Operator workflow should include a supervisor-style batch command that advances work automatically, exports any newly completed photos, and stops only when the next review item requires human input.
+The supervisor should print categorized review counts such as `crop_detection`, `rotation`, and `ocr`, plus the exact next CLI command the operator should run to clear the next blocker.
+Detection review should also include an audit for suspicious same-sheet geometry, such as overlapping accepted photo candidates or one unusually wide strip candidate that likely contains two adjacent photos.
+It should also flag a wide candidate when one half of that candidate looks visually similar to another photo candidate on the same sheet, which is a strong sign of a duplicated wide crop rather than two legitimate independent photos.
 
 The design deliberately avoids a web service, distributed workers, or full automatic face labeling in the first version. Those would add complexity before the hard parts are stable.
 
@@ -190,6 +193,12 @@ photos/
   originals/{scan_batch_id}/{sheet_id}.jpg
   crops/{photo_id}/raw.jpg
   finals/{photo_id}/master.jpg
+  exports/
+    staging/
+      landscape/
+      portrait/
+    frame_1920x1080/
+    frame_1080x1920/
   derivatives/thumbnails/{photo_id}.jpg
   derivatives/review/{photo_id}.jpg
 ```
@@ -199,6 +208,13 @@ photos/
 - never overwrite original scans
 - write derived images atomically where possible
 - keep final outputs separate from intermediate outputs
+- route newly processed frame exports into `exports/staging/` first
+- auto-apply best-guess orientation and deskew corrections before staging instead of blocking on orientation review
+- record review confidence in the staging CSV so the operator reviews the staged image, not the intermediate uncertainty
+- promote reviewed-good staging exports into the final frame folders only after review
+- provide a single operator command to advance the next review slice all the way to a refreshed staging CSV
+- after CSV review, importing the staging CSV should auto-apply all supported fixes before returning to the refreshed CSV
+- allow OCR review to be bulk-dismissed when text correction is out of scope for the current pass
 - keep file naming deterministic
 - record all paths in the database
 - make it possible to garbage-collect obsolete derivatives later

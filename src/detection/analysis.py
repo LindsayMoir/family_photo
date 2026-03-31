@@ -30,6 +30,9 @@ SUBDIVISION_MIN_COMPONENT_AREA_RATIO = 0.025
 INTENSITY_MASK_THRESHOLD = 205
 MIN_TEXT_BOX_COVERAGE = 0.01
 MIN_TEXT_HEIGHT_RATIO_FOR_LOW_CONFIDENCE = 0.18
+WIDE_DUPLICATE_WIDTH_RATIO = 0.75
+WIDE_DUPLICATE_HALF_SIMILARITY = 0.83
+WIDE_DUPLICATE_MIN_OTHER_AREA_RATIO = 0.05
 
 
 def detect_sheet_regions(image_path: Path, *, fast_mode: bool = False) -> list[DetectionCandidate]:
@@ -98,6 +101,49 @@ def write_candidate_crop(image_path: Path, candidate: DetectionCandidate, output
     if not cv2.imwrite(str(output_path), crop):
         raise ValueError(f"Failed to write crop image: {output_path}")
     return output_path
+
+
+def has_duplicate_wide_photo_candidate(
+    image_path: Path,
+    photo_candidates: list[DetectionCandidate],
+) -> bool:
+    """Return True when a wide candidate appears to duplicate another photo on the sheet."""
+    if len(photo_candidates) < 2:
+        return False
+
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Unable to load image for duplicate-wide audit: {image_path}")
+
+    image_height, image_width = image.shape[:2]
+    for candidate in photo_candidates:
+        x1, y1, x2, y2 = _bounds(candidate.box_points)
+        width = x2 - x1
+        height = y2 - y1
+        if width <= 0 or height <= 0:
+            continue
+        if (width / float(image_width)) < WIDE_DUPLICATE_WIDTH_RATIO:
+            continue
+
+        half_midpoint = x1 + (width // 2)
+        left_half = image[y1:y2, x1:half_midpoint]
+        right_half = image[y1:y2, half_midpoint:x2]
+        if left_half.size == 0 or right_half.size == 0:
+            continue
+
+        for other in photo_candidates:
+            if other is candidate or other.area_ratio < WIDE_DUPLICATE_MIN_OTHER_AREA_RATIO:
+                continue
+            other_x1, other_y1, other_x2, other_y2 = _bounds(other.box_points)
+            other_crop = image[other_y1:other_y2, other_x1:other_x2]
+            if other_crop.size == 0:
+                continue
+
+            if _crop_similarity(left_half, other_crop) >= WIDE_DUPLICATE_HALF_SIMILARITY:
+                return True
+            if _crop_similarity(right_half, other_crop) >= WIDE_DUPLICATE_HALF_SIMILARITY:
+                return True
+    return False
 
 
 def _detect_photo_candidates(image: np.ndarray) -> list[DetectionCandidate]:
@@ -514,6 +560,19 @@ def _score_photo_candidate(area_ratio: float, rectangularity: float) -> float:
     area_score = min(area_ratio / 0.10, 1.0)
     rectangularity_score = min(max((rectangularity - 0.70) / 0.30, 0.0), 1.0)
     return round((0.45 * area_score) + (0.55 * rectangularity_score), 4)
+
+
+def _crop_similarity(left: np.ndarray, right: np.ndarray) -> float:
+    left_gray = cv2.cvtColor(left, cv2.COLOR_BGR2GRAY)
+    right_gray = cv2.cvtColor(right, cv2.COLOR_BGR2GRAY)
+    target_size = (64, 64)
+    left_resized = cv2.resize(left_gray, target_size, interpolation=cv2.INTER_AREA)
+    right_resized = cv2.resize(right_gray, target_size, interpolation=cv2.INTER_AREA)
+    left_normalized = cv2.equalizeHist(left_resized)
+    right_normalized = cv2.equalizeHist(right_resized)
+    difference = cv2.absdiff(left_normalized, right_normalized)
+    mean_difference = float(np.mean(difference))
+    return max(0.0, 1.0 - (mean_difference / 255.0))
 
 
 def _suppress_overlaps(candidates: list[DetectionCandidate]) -> list[DetectionCandidate]:

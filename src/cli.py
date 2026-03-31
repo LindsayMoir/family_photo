@@ -9,6 +9,8 @@ import sys
 from typing import Sequence
 
 from app_logging import configure_logging
+from audit.import_service import import_audit_csv
+from audit.service import run_export_audit
 from config import AppConfig, ConfigError, load_config
 from crop.service import run_crop
 from db.schema import SCHEMA_PATH, read_initial_schema
@@ -18,23 +20,26 @@ from disposition.service import set_photo_export_disposition
 from enhance.service import run_enhancement
 from frame_export.service import (
     FRAME_PRESETS,
+    promote_staging_exports,
     resolve_frame_export_request,
     run_frame_export,
 )
 from ingest.service import run_ingest
 from orientation.service import run_orientation
-from pipeline.service import run_batch, run_process
+from pipeline.service import run_batch, run_process, run_review_slice, run_until_review
 from pipeline.types import CommandPlan
 from review.service import (
     accept_detections,
     apply_orientation_review,
     add_manual_detection,
+    dismiss_ocr_reviews,
     export_ocr_text,
     get_next_task,
     get_sheet_backlog,
     get_task,
     list_sheet_tasks,
     list_tasks,
+    resolve_export_audit_review,
     resolve_task,
 )
 
@@ -118,6 +123,36 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use faster printed-only OCR during detection.",
     )
 
+    run_next_slice_parser = subparsers.add_parser(
+        "run-next-slice",
+        help="Advance the next unresolved sheet-review slice through staging CSV generation.",
+    )
+    _add_dry_run_argument(run_next_slice_parser)
+    run_next_slice_parser.add_argument("--batch", required=True, help="Batch name to process.")
+    run_next_slice_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of open sheet review tasks to advance.",
+    )
+    run_until_review_parser = subparsers.add_parser(
+        "run-until-review",
+        help="Keep processing one batch until a true blocker or a fresh staging CSV handoff appears.",
+    )
+    _add_dry_run_argument(run_until_review_parser)
+    run_until_review_parser.add_argument("--batch", required=True, help="Batch name to process.")
+    run_until_review_parser.add_argument(
+        "--review-slice-limit",
+        type=int,
+        default=100,
+        help="Maximum number of open sheet review tasks to advance per slice.",
+    )
+    run_until_review_parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Use faster printed-only OCR during detection.",
+    )
+
     crop_parser = subparsers.add_parser("crop", help="Promote accepted photo detections into photo records.")
     _add_dry_run_argument(crop_parser)
     crop_parser.add_argument("--sheet-id", required=True, type=int)
@@ -176,6 +211,49 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output profile directory name under photos/exports.",
     )
 
+    audit_parser = subparsers.add_parser(
+        "audit-exports",
+        help="Classify exported photos into grouped issue categories for operator review.",
+    )
+    _add_dry_run_argument(audit_parser)
+    audit_target = audit_parser.add_mutually_exclusive_group(required=False)
+    audit_target.add_argument("--batch", help="Batch name to audit.")
+    audit_target.add_argument("--sheet-id", type=int, help="Single sheet scan id to audit.")
+    audit_target.add_argument("--photo-id", type=int, help="Single photo id to audit.")
+    audit_parser.add_argument("--limit", type=int, help="Optional maximum number of exported photos to audit.")
+    audit_parser.add_argument(
+        "--category",
+        choices=["ok", "rotation", "merged_detection", "source_ambiguous"],
+        help="Optional filter for a single audit category.",
+    )
+    audit_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="Optional CSV output path. Defaults to photos/exports/staging/export_audit.csv.",
+    )
+
+    import_audit_parser = subparsers.add_parser(
+        "import-audit-csv",
+        help="Read operator flags from the export audit CSV and create photo review tasks.",
+    )
+    _add_dry_run_argument(import_audit_parser)
+    import_audit_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="CSV path to import. Defaults to photos/exports/staging/export_audit.csv.",
+    )
+
+    promote_exports_parser = subparsers.add_parser(
+        "promote-exports",
+        help="Promote reviewed-good staging exports into the final frame folders.",
+    )
+    _add_dry_run_argument(promote_exports_parser)
+    promote_exports_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="CSV path to use for promotion. Defaults to photos/exports/staging/export_audit.csv.",
+    )
+
     review_parser = subparsers.add_parser("review", help="Inspect or resolve review tasks.")
     _add_dry_run_argument(review_parser)
     review_subparsers = review_parser.add_subparsers(dest="review_command", required=True)
@@ -183,7 +261,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dry_run_argument(review_list)
     review_list.add_argument(
         "--task-type",
-        choices=["review_detection", "review_ocr", "review_orientation"],
+        choices=["review_detection", "review_ocr", "review_orientation", "review_export_audit"],
         help="Optional filter for a specific review task type.",
     )
     review_list.add_argument(
@@ -201,7 +279,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dry_run_argument(review_next)
     review_next.add_argument(
         "--task-type",
-        choices=["review_detection", "review_ocr", "review_orientation"],
+        choices=["review_detection", "review_ocr", "review_orientation", "review_export_audit"],
         help="Optional filter for a specific review task type.",
     )
     review_show = review_subparsers.add_parser(
@@ -243,6 +321,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=[0, 90, 180, 270],
     )
     review_set_orientation.add_argument("--note", help="Optional reviewer note.")
+    review_resolve_export_audit = review_subparsers.add_parser(
+        "resolve-export-audit",
+        help="Resolve a review_export_audit task with an explicit operator action.",
+    )
+    _add_dry_run_argument(review_resolve_export_audit)
+    review_resolve_export_audit.add_argument("--task-id", required=True, type=int)
+    review_resolve_export_audit.add_argument(
+        "--export-action",
+        required=True,
+        choices=["accepted", "fix_rotation", "fix_crop", "exclude", "defer"],
+    )
+    review_resolve_export_audit.add_argument("--note", help="Optional reviewer note.")
     review_add_detection = review_subparsers.add_parser(
         "add-detection",
         help="Create a manual detection for a sheet-level review task.",
@@ -303,6 +393,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=25,
         help="Maximum number of review tasks to show.",
     )
+    review_dismiss_ocr = review_subparsers.add_parser(
+        "dismiss-ocr",
+        help="Dismiss open OCR review tasks when OCR is out of scope.",
+    )
+    _add_dry_run_argument(review_dismiss_ocr)
+    review_dismiss_ocr.add_argument("--batch", help="Optional batch name filter.")
 
     detect_faces_parser = subparsers.add_parser(
         "detect-faces",
@@ -392,6 +488,23 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             dry_run=args.dry_run,
         )
         return 0
+    if args.command == "run-next-slice":
+        _handle_run_next_slice(
+            config,
+            batch_name=args.batch,
+            limit=args.limit,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "run-until-review":
+        _handle_run_until_review(
+            config,
+            batch_name=args.batch,
+            review_slice_limit=args.review_slice_limit,
+            fast_mode=args.fast,
+            dry_run=args.dry_run,
+        )
+        return 0
     if args.command == "crop":
         _handle_crop(config, sheet_id=args.sheet_id, dry_run=args.dry_run)
         return 0
@@ -429,6 +542,32 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             width_px=args.width,
             height_px=args.height,
             profile_name=args.profile,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "audit-exports":
+        _handle_audit_exports(
+            config,
+            batch_name=args.batch,
+            sheet_id=args.sheet_id,
+            photo_id=args.photo_id,
+            limit=args.limit,
+            category=args.category,
+            csv_path=args.csv_path,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "import-audit-csv":
+        _handle_import_audit_csv(
+            config,
+            csv_path=args.csv_path,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "promote-exports":
+        _handle_promote_exports(
+            config,
+            csv_path=args.csv_path,
             dry_run=args.dry_run,
         )
         return 0
@@ -565,7 +704,7 @@ def _handle_run_batch(
                 dry_run=True,
                 notes=(
                     f"fast_mode={str(fast_mode).lower()}",
-                    "run detect, crop, deskew, orient, enhance, and export-frame",
+                    "run detect, crop, deskew, orient, enhance, and export-frame into staging",
                     "show the next blocking review task when manual input is required",
                 ),
             )
@@ -588,8 +727,14 @@ def _handle_run_batch(
     print(f"photos_processed={result.photos_processed}")
     print(f"review_required_sheets={result.review_required_sheets}")
     print(f"exported_count={result.exported_count}")
+    if result.exported_count > 0:
+        print(f"staging_csv_path={config.photos_root / 'exports' / 'staging' / 'export_audit.csv'}")
+        print("next_staging_review_command=PYTHONPATH=src python3 -m cli audit-exports")
+    _print_run_batch_review_summary(result.review_task_counts)
     if result.blocking_task is None:
         print("next_review_task=none")
+        if not result.review_task_counts:
+            print("next_action=run-batch completed with no open review tasks")
         return
     print(f"next_review_task_id={result.blocking_task.id}")
     print(f"next_review_task_type={result.blocking_task.task_type}")
@@ -597,6 +742,94 @@ def _handle_run_batch(
     print(f"next_review_entity_id={result.blocking_task.entity_id}")
     print(f"next_review_reason={result.blocking_task.payload_json.get('review_reason', '')}")
     print(f"next_review_preview_path={result.blocking_task.payload_json.get('preview_path', '')}")
+    _print_run_batch_next_actions(result.blocking_task.task_type)
+
+
+def _handle_run_next_slice(
+    config: AppConfig,
+    *,
+    batch_name: str,
+    limit: int,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="run-next-slice",
+                target=batch_name,
+                dry_run=True,
+                notes=(
+                    f"limit={limit}",
+                    "accept the next open review_detection tasks that already have photo detections",
+                    "run crop, deskew, orient, enhance, export-frame into staging, and refresh the staging CSV",
+                ),
+            )
+        )
+        return
+
+    result = run_review_slice(
+        config,
+        batch_name=batch_name,
+        limit=limit,
+        dry_run=False,
+    )
+    print("command=run-next-slice")
+    print(f"target={result.target}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"requested_tasks={result.requested_tasks}")
+    print(f"actionable_tasks={result.actionable_tasks}")
+    print(f"skipped_tasks_without_photo_detections={result.skipped_tasks_without_photo_detections}")
+    print(f"photos_processed={result.photos_processed}")
+    print(f"staged_photo_count={result.staged_photo_count}")
+    print(f"staging_csv_path={result.staging_csv_path}")
+    print("next_action=review only photos/exports/staging/export_audit.csv")
+
+
+def _handle_run_until_review(
+    config: AppConfig,
+    *,
+    batch_name: str,
+    review_slice_limit: int,
+    fast_mode: bool,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="run-until-review",
+                target=batch_name,
+                dry_run=True,
+                notes=(
+                    f"review_slice_limit={review_slice_limit}",
+                    f"fast_mode={str(fast_mode).lower()}",
+                    "keep processing ingested sheets and auto-advancing actionable review slices",
+                    "stop only at a fresh staging CSV handoff or a true non-actionable blocker",
+                ),
+            )
+        )
+        return
+
+    result = run_until_review(
+        config,
+        batch_name=batch_name,
+        fast_mode=fast_mode,
+        review_slice_limit=review_slice_limit,
+        dry_run=False,
+    )
+    print("command=run-until-review")
+    print(f"target={result.target}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"batch_runs={result.batch_runs}")
+    print(f"review_slice_runs={result.review_slice_runs}")
+    print(f"pending_sheets={result.pending_sheets}")
+    print(f"open_sheet_tasks={result.open_sheet_tasks}")
+    print(f"staged_photo_count={result.staged_photo_count}")
+    print(f"blocked={str(result.blocked).lower()}")
+    if result.blocked_reason is not None:
+        print(f"blocked_reason={result.blocked_reason}")
+    print(f"staging_csv_path={result.staging_csv_path}")
+    if result.staged_photo_count > 0:
+        print("next_action=review only photos/exports/staging/export_audit.csv")
 
 
 def _handle_crop(config: AppConfig, *, sheet_id: int, dry_run: bool) -> None:
@@ -714,6 +947,147 @@ def _handle_export_frame(
         print("frame_size=auto")
     else:
         print(f"frame_size={result.width_px}x{result.height_px}")
+
+
+def _handle_audit_exports(
+    config: AppConfig,
+    *,
+    batch_name: str | None,
+    sheet_id: int | None,
+    photo_id: int | None,
+    limit: int | None,
+    category: str | None,
+    csv_path: Path | None,
+    dry_run: bool,
+) -> None:
+    if dry_run:
+        target = (
+            batch_name
+            if batch_name is not None
+            else f"sheet_id={sheet_id}" if sheet_id is not None else f"photo_id={photo_id}" if photo_id is not None else "all_staging_exports"
+        )
+        notes = ["classify staged exports as ok, rotation, merged_detection, or source_ambiguous"]
+        if category is not None:
+            notes.append(f"category={category}")
+        if csv_path is not None:
+            notes.append(f"csv_path={csv_path}")
+        else:
+            notes.append("default_csv_path=photos/exports/staging/export_audit.csv")
+        _print_plan(
+            CommandPlan(
+                command_name="audit-exports",
+                target=target,
+                dry_run=True,
+                notes=tuple(notes),
+            )
+        )
+        return
+
+    result = run_export_audit(
+        config,
+        batch_name=batch_name,
+        sheet_id=sheet_id,
+        photo_id=photo_id,
+        limit=limit,
+        category=category,
+        csv_path=csv_path,
+        dry_run=False,
+    )
+    print("command=audit-exports")
+    print(f"target={result.target}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"audited_count={result.audited_count}")
+    if result.csv_path is not None:
+        print(f"csv_path={result.csv_path}")
+    for category_name in ("merged_detection", "rotation", "source_ambiguous", "ok"):
+        if category_name in result.category_counts:
+            print(f"category_count={category_name}:{result.category_counts[category_name]}")
+    if not result.findings:
+        print("audit_findings=none")
+        return
+    print("category\tphoto_id\tsheet_id\tcrop_index\treason\texport_path")
+    for finding in result.findings:
+        print(
+            f"{finding.category}\t{finding.photo_id}\t{finding.sheet_scan_id}\t"
+            f"{finding.crop_index}\t{finding.reason}\t{finding.export_path}"
+        )
+
+
+def _handle_import_audit_csv(
+    config: AppConfig,
+    *,
+    csv_path: Path | None,
+    dry_run: bool,
+) -> None:
+    resolved_csv_path = (
+        csv_path
+        if csv_path is not None
+        else config.photos_root / "exports" / "staging" / "export_audit.csv"
+    )
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="import-audit-csv",
+                target=str(resolved_csv_path),
+                dry_run=True,
+                notes=(
+                    "promote clean rows, delete DELETE rows, auto-apply supported fixes, and refresh staging CSV",
+                ),
+            )
+        )
+        return
+
+    result = import_audit_csv(
+        config,
+        csv_path=resolved_csv_path,
+        dry_run=False,
+    )
+    print("command=import-audit-csv")
+    print(f"csv_path={result.csv_path}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"processed_rows={result.processed_rows}")
+    print(f"flagged_rows={result.flagged_rows}")
+    print(f"created_or_updated_count={result.created_or_updated_count}")
+    print(f"dismissed_count={result.dismissed_count}")
+    print(f"deleted_count={result.deleted_count}")
+    print(f"promoted_count={result.promoted_count}")
+    print(f"auto_fixed_count={result.auto_fixed_count}")
+    print(f"auto_fix_unresolved_count={result.auto_fix_unresolved_count}")
+    print(f"created_photo_count={result.created_photo_count}")
+
+
+def _handle_promote_exports(
+    config: AppConfig,
+    *,
+    csv_path: Path | None,
+    dry_run: bool,
+) -> None:
+    resolved_csv_path = (
+        csv_path
+        if csv_path is not None
+        else config.photos_root / "exports" / "staging" / "export_audit.csv"
+    )
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="promote-exports",
+                target=str(resolved_csv_path),
+                dry_run=True,
+                notes=("promote staging rows with blank needs_help into final frame folders",),
+            )
+        )
+        return
+
+    result = promote_staging_exports(
+        config,
+        csv_path=resolved_csv_path,
+        dry_run=False,
+    )
+    print("command=promote-exports")
+    print(f"csv_path={result.csv_path}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"promoted_count={result.promoted_count}")
+    print(f"skipped_count={result.skipped_count}")
 
 
 def _handle_review(config: AppConfig, args: argparse.Namespace, dry_run: bool) -> None:
@@ -850,6 +1224,30 @@ def _handle_review(config: AppConfig, args: argparse.Namespace, dry_run: bool) -
         print(f"task_type={task.task_type}")
         print(f"photo_id={task.entity_id}")
         return
+    if args.review_command == "resolve-export-audit":
+        if dry_run:
+            _print_plan(
+                CommandPlan(
+                    command_name="review resolve-export-audit",
+                    target=f"task_id={args.task_id}",
+                    dry_run=True,
+                    notes=(f"export_action={args.export_action}",),
+                )
+            )
+            return
+        task = resolve_export_audit_review(
+            config,
+            task_id=args.task_id,
+            export_action=args.export_action,
+            note=args.note,
+            dry_run=False,
+        )
+        print(f"task_id={task.id}")
+        print(f"status={task.status}")
+        print(f"task_type={task.task_type}")
+        print(f"photo_id={task.entity_id}")
+        print(f"export_action={args.export_action}")
+        return
     if args.review_command == "show":
         if dry_run:
             _print_plan(
@@ -960,15 +1358,89 @@ def _handle_review(config: AppConfig, args: argparse.Namespace, dry_run: bool) -
         print(f"task_type={task.task_type}")
         print(f"status={task.status}")
         return
+    if args.review_command == "dismiss-ocr":
+        dismissed_count = dismiss_ocr_reviews(
+            config,
+            batch_name=args.batch,
+            dry_run=dry_run,
+        )
+        print(f"batch={args.batch or 'all_batches'}")
+        print(f"dry_run={str(dry_run).lower()}")
+        print(f"dismissed_count={dismissed_count}")
+        return
     raise ValueError(f"Unsupported review command '{args.review_command}'.")
 
 
 def _task_preview(payload: dict[str, object]) -> str:
-    preview_value = payload.get("ocr_preview") or payload.get("review_reason") or payload.get("crop_path")
+    preview_value = (
+        payload.get("issue")
+        or payload.get("operator_issue")
+        or payload.get("audit_reason")
+        or payload.get("export_path")
+        or payload.get("ocr_preview")
+        or payload.get("review_reason")
+        or payload.get("crop_path")
+    )
     if preview_value is None:
         return ""
     preview = str(preview_value).replace("\n", " ").strip()
     return preview[:80]
+
+
+def _print_run_batch_review_summary(task_counts: dict[str, int]) -> None:
+    if not task_counts:
+        print("review_summary=none")
+        return
+
+    category_by_task_type = {
+        "review_detection": "crop_detection",
+        "review_orientation": "rotation",
+        "review_ocr": "ocr",
+        "review_export_audit": "export_audit",
+    }
+    ordered_task_types = ("review_detection", "review_orientation", "review_ocr", "review_export_audit")
+    remaining_task_types = sorted(
+        task_type for task_type in task_counts if task_type not in ordered_task_types
+    )
+    for task_type in (*ordered_task_types, *remaining_task_types):
+        count = task_counts.get(task_type)
+        if count is None:
+            continue
+        category = category_by_task_type.get(task_type, task_type.removeprefix("review_"))
+        print(f"review_category_count={category}:{count}")
+
+
+def _print_run_batch_next_actions(task_type: str) -> None:
+    if task_type == "review_detection":
+        print("next_action=review sheet-level crop/detection issue")
+        print("next_command=PYTHONPATH=src python3 -m cli review show --task-id <task_id>")
+        print(
+            "followup_command=PYTHONPATH=src python3 -m cli review accept-detection --task-id <task_id> --detection-id <detection_id>"
+        )
+        return
+    if task_type == "review_orientation":
+        print("next_action=review rotation issue")
+        print("next_command=PYTHONPATH=src python3 -m cli review show --task-id <task_id>")
+        print(
+            "followup_command=PYTHONPATH=src python3 -m cli review set-orientation --task-id <task_id> --rotation-degrees 0|90|180|270"
+        )
+        return
+    if task_type == "review_ocr":
+        print("next_action=review OCR issue")
+        print("next_command=PYTHONPATH=src python3 -m cli review show --task-id <task_id>")
+        print(
+            "followup_command=PYTHONPATH=src python3 -m cli review resolve --task-id <task_id> --ocr-text \"corrected text\""
+        )
+        return
+    if task_type == "review_export_audit":
+        print("next_action=review spreadsheet-flagged export issue")
+        print("next_command=PYTHONPATH=src python3 -m cli review show --task-id <task_id>")
+        print(
+            "followup_command=update photos/exports/staging/export_audit.csv then run PYTHONPATH=src python3 -m cli import-audit-csv"
+        )
+        return
+    print(f"next_action=review task type {task_type}")
+    print("next_command=PYTHONPATH=src python3 -m cli review show --task-id <task_id>")
 
 
 def _print_plan(plan: CommandPlan) -> None:

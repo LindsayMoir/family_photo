@@ -36,3 +36,10 @@ class SheetReviewBacklog:
     batch_name: str | None
     sheet_status_counts: dict[str, int]
     open_tasks: list[ReviewTask]
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewTaskSummary:
+    """Counts of open review work grouped by task type."""
+
+    task_counts: dict[str, int]

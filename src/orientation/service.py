@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 from pathlib import Path
 
 import cv2
@@ -19,7 +18,6 @@ from photo_repository import (
 
 
 ORIENTATION_STATUS = "orientation_complete"
-ORIENTATION_REVIEW_STATUS = "orientation_review_required"
 ORIENTATION_ARTIFACT_TYPE = "oriented"
 ORIENTATION_PIPELINE_VERSION = "orientation_v2"
 ORIENTATION_MANUAL_PIPELINE_VERSION = "orientation_manual_v1"
@@ -51,7 +49,7 @@ def run_orientation(
     forced_rotation: int | None = None,
     dry_run: bool,
 ) -> OrientationSummary:
-    """Select a cardinal rotation and require review when confidence is too low."""
+    """Select and apply a cardinal rotation, even when confidence is low."""
     with connect(config) as conn:
         photo = get_photo_record(conn, photo_id=photo_id)
         input_path = _resolve_orientation_input_path(
@@ -83,32 +81,6 @@ def run_orientation(
             dry_run=True,
         )
 
-    if decision.review_required and forced_rotation is None:
-        with connect(config) as conn:
-            _upsert_orientation_review_task(
-                conn,
-                photo_id=photo_id,
-                preview_path=input_path,
-                suggested_rotation=decision.rotation_degrees,
-                confidence=decision.confidence,
-                score_by_rotation=decision.score_by_rotation,
-            )
-            update_photo_stage(
-                conn,
-                photo_id=photo_id,
-                working_path=photo.working_path,
-                status=ORIENTATION_REVIEW_STATUS,
-            )
-            conn.commit()
-        return OrientationSummary(
-            photo_id=photo_id,
-            rotation_degrees=decision.rotation_degrees,
-            confidence=decision.confidence,
-            review_required=True,
-            output_path=output_path,
-            dry_run=False,
-        )
-
     _write_oriented_image(input_path, output_path, decision.rotation_degrees)
 
     with connect(config) as conn:
@@ -138,10 +110,15 @@ def run_orientation(
         photo_id=photo_id,
         rotation_degrees=decision.rotation_degrees,
         confidence=decision.confidence,
-        review_required=False,
+        review_required=decision.review_required,
         output_path=output_path,
         dry_run=False,
     )
+
+
+def audit_orientation_image(image_path: Path) -> OrientationDecision:
+    """Return an orientation decision for an existing image without updating state."""
+    return _select_rotation(image_path)
 
 
 def _select_rotation(image_path: Path) -> OrientationDecision:
@@ -230,50 +207,6 @@ def _resolve_orientation_input_path(
     return fallback_path
 
 
-def _upsert_orientation_review_task(
-    conn,
-    *,
-    photo_id: int,
-    preview_path: Path,
-    suggested_rotation: int,
-    confidence: float,
-    score_by_rotation: dict[int, float],
-) -> None:
-    payload_json = json.dumps(
-        {
-            "preview_path": str(preview_path),
-            "suggested_rotation": suggested_rotation,
-            "confidence": confidence,
-            "score_by_rotation": score_by_rotation,
-        }
-    )
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            DELETE FROM review_tasks
-            WHERE entity_type = 'photo'
-              AND entity_id = %s
-              AND task_type = 'review_orientation'
-              AND status IN ('open', 'in_progress')
-            """,
-            (photo_id,),
-        )
-        cur.execute(
-            """
-            INSERT INTO review_tasks (
-                entity_type,
-                entity_id,
-                task_type,
-                status,
-                priority,
-                payload_json
-            )
-            VALUES ('photo', %s, 'review_orientation', 'open', %s, %s::jsonb)
-            """,
-            (photo_id, 15, payload_json),
-        )
-
-
 def _resolve_open_orientation_review_task(conn, *, photo_id: int) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -287,5 +220,5 @@ def _resolve_open_orientation_review_task(conn, *, photo_id: int) -> None:
               AND task_type = 'review_orientation'
               AND status IN ('open', 'in_progress')
             """,
-            (json.dumps({"action": "orientation_applied"}), photo_id),
+            ('{"action":"orientation_applied"}', photo_id),
         )

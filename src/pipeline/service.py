@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from audit.service import run_export_audit
 from config import AppConfig
 from crop.service import run_crop
 from db.connection import connect
 from deskew.service import run_deskew
-from detection.repository import get_sheet_scans
+from detection.repository import SHEET_STATUS_INGESTED, count_sheet_scans_by_status, get_sheet_scans
 from detection.service import run_detection
 from enhance.service import run_enhancement
 from frame_export.service import (
@@ -18,7 +19,13 @@ from frame_export.service import (
 from orientation.service import run_orientation
 from photo_repository import list_export_ready_photo_ids, list_photo_ids_for_sheet
 from review.models import ReviewTask
-from review.service import get_next_sheet_task, get_next_task
+from review.service import (
+    accept_detections,
+    get_next_sheet_task,
+    get_task,
+    get_task_summary,
+    list_sheet_tasks,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +48,38 @@ class RunBatchSummary:
     photos_processed: int
     review_required_sheets: int
     exported_count: int
+    review_task_counts: dict[str, int]
     blocking_task: ReviewTask | None
+    dry_run: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RunReviewSliceSummary:
+    """Summary of advancing the next unresolved review-driven slice."""
+
+    target: str
+    requested_tasks: int
+    actionable_tasks: int
+    skipped_tasks_without_photo_detections: int
+    photos_processed: int
+    staged_photo_count: int
+    staging_csv_path: str
+    dry_run: bool
+
+
+@dataclass(frozen=True, slots=True)
+class RunUntilReviewSummary:
+    """Summary of a keep-going supervisor pass for one batch."""
+
+    target: str
+    batch_runs: int
+    review_slice_runs: int
+    pending_sheets: int
+    open_sheet_tasks: int
+    staged_photo_count: int
+    blocked: bool
+    blocked_reason: str | None
+    staging_csv_path: str
     dry_run: bool
 
 
@@ -56,11 +94,17 @@ def run_process(
 ) -> ProcessSummary:
     """Run the current pipeline across one sheet or a batch of sheets."""
     with connect(config) as conn:
-        sheets = get_sheet_scans(conn, batch_name=batch_name, sheet_id=sheet_id, limit=limit)
+        sheets = get_sheet_scans(
+            conn,
+            batch_name=batch_name,
+            sheet_id=sheet_id,
+            limit=limit,
+            pending_only=batch_name is not None and sheet_id is None,
+        )
 
     if not sheets:
         target = batch_name if batch_name is not None else f"sheet_id={sheet_id}"
-        raise ValueError(f"No sheet scans found for target '{target}'.")
+        raise ValueError(f"No pending sheet scans found for target '{target}'.")
 
     photos_processed = 0
     review_required_sheets = 0
@@ -84,10 +128,7 @@ def run_process(
 
         for photo_id in photo_ids:
             run_deskew(config, photo_id=photo_id, dry_run=dry_run)
-            orientation_result = run_orientation(config, photo_id=photo_id, dry_run=dry_run)
-            if orientation_result.review_required:
-                review_required_sheets += 1
-                continue
+            run_orientation(config, photo_id=photo_id, dry_run=dry_run)
             run_enhancement(config, photo_id=photo_id, dry_run=dry_run)
             photos_processed += 1
 
@@ -148,21 +189,264 @@ def run_batch(
         )
         exported_count = export_summary.exported_count
 
+    review_task_counts: dict[str, int] = {}
     blocking_task = None
     if not dry_run:
+        review_task_counts = get_task_summary(
+            config,
+            batch_name=batch_name,
+            sheet_id=sheet_id,
+        ).task_counts
         blocking_task = get_next_sheet_task(
             config,
             batch_name=batch_name,
             sheet_id=sheet_id,
         )
-        if blocking_task is None:
-            blocking_task = get_next_task(config, task_type="review_orientation")
     return RunBatchSummary(
         target=process_summary.target,
         sheets_processed=process_summary.sheets_processed,
         photos_processed=process_summary.photos_processed,
         review_required_sheets=process_summary.review_required_sheets,
         exported_count=exported_count,
+        review_task_counts=review_task_counts,
         blocking_task=blocking_task,
         dry_run=dry_run,
+    )
+
+
+def run_review_slice(
+    config: AppConfig,
+    *,
+    batch_name: str,
+    limit: int,
+    dry_run: bool,
+) -> RunReviewSliceSummary:
+    """Advance the next unresolved sheet-review slice through staging audit refresh."""
+    if limit <= 0:
+        raise ValueError("limit must be a positive integer.")
+
+    open_tasks = list_sheet_tasks(
+        config,
+        batch_name=batch_name,
+        status="open",
+        limit=limit,
+    )
+    if not open_tasks:
+        raise ValueError(f"No open sheet review tasks found for batch '{batch_name}'.")
+
+    actionable_tasks: list[tuple[int, int, list[int]]] = []
+    skipped_tasks_without_photo_detections = 0
+
+    for task in open_tasks:
+        detailed_task = get_task(config, task.id)
+        if detailed_task is None:
+            continue
+        detection_ids = [
+            int(detection["id"])
+            for detection in detailed_task.payload_json.get("detections", [])
+            if detection.get("region_type") == "photo"
+        ]
+        if not detection_ids:
+            skipped_tasks_without_photo_detections += 1
+            continue
+        actionable_tasks.append((task.id, task.entity_id, detection_ids))
+
+    if dry_run:
+        return RunReviewSliceSummary(
+            target=batch_name,
+            requested_tasks=len(open_tasks),
+            actionable_tasks=len(actionable_tasks),
+            skipped_tasks_without_photo_detections=skipped_tasks_without_photo_detections,
+            photos_processed=0,
+            staged_photo_count=0,
+            staging_csv_path=str(config.photos_root / "exports" / "staging" / "export_audit.csv"),
+            dry_run=True,
+        )
+
+    export_width, export_height, export_profile = resolve_frame_export_request(
+        preset_name="auto",
+        width_px=None,
+        height_px=None,
+        profile_name=None,
+    )
+
+    photos_processed = 0
+    for task_id, sheet_id, detection_ids in actionable_tasks:
+        accept_detections(
+            config,
+            task_id=task_id,
+            detection_ids=detection_ids,
+            note="Auto-accepted by run-next-slice",
+        )
+        run_crop(config, sheet_id=sheet_id, dry_run=False)
+
+        with connect(config) as conn:
+            photo_ids = list_photo_ids_for_sheet(conn, sheet_id=sheet_id)
+
+        for photo_id in photo_ids:
+            run_deskew(config, photo_id=photo_id, dry_run=False)
+            run_orientation(config, photo_id=photo_id, dry_run=False)
+            run_enhancement(config, photo_id=photo_id, dry_run=False)
+            run_frame_export(
+                config,
+                batch_name=None,
+                sheet_id=None,
+                photo_id=photo_id,
+                limit=None,
+                width_px=export_width,
+                height_px=export_height,
+                profile_name=export_profile,
+                dry_run=False,
+            )
+            photos_processed += 1
+
+    audit_summary = run_export_audit(
+        config,
+        batch_name=None,
+        sheet_id=None,
+        photo_id=None,
+        limit=None,
+        category=None,
+        csv_path=None,
+        dry_run=False,
+    )
+
+    return RunReviewSliceSummary(
+        target=batch_name,
+        requested_tasks=len(open_tasks),
+        actionable_tasks=len(actionable_tasks),
+        skipped_tasks_without_photo_detections=skipped_tasks_without_photo_detections,
+        photos_processed=photos_processed,
+        staged_photo_count=audit_summary.audited_count,
+        staging_csv_path=str(audit_summary.csv_path),
+        dry_run=False,
+    )
+
+
+def run_until_review(
+    config: AppConfig,
+    *,
+    batch_name: str,
+    fast_mode: bool,
+    review_slice_limit: int,
+    dry_run: bool,
+) -> RunUntilReviewSummary:
+    """Keep processing one batch until a true blocker or a fresh staging handoff appears."""
+    if review_slice_limit <= 0:
+        raise ValueError("review_slice_limit must be a positive integer.")
+
+    staging_csv_path = str(config.photos_root / "exports" / "staging" / "export_audit.csv")
+    if dry_run:
+        return RunUntilReviewSummary(
+            target=batch_name,
+            batch_runs=0,
+            review_slice_runs=0,
+            pending_sheets=0,
+            open_sheet_tasks=0,
+            staged_photo_count=0,
+            blocked=False,
+            blocked_reason=None,
+            staging_csv_path=staging_csv_path,
+            dry_run=True,
+        )
+
+    batch_runs = 0
+    review_slice_runs = 0
+    staged_photo_count = 0
+    blocked = False
+    blocked_reason: str | None = None
+
+    for _ in range(1000):
+        with connect(config) as conn:
+            pending_sheets = count_sheet_scans_by_status(
+                conn,
+                batch_name=batch_name,
+                status=SHEET_STATUS_INGESTED,
+            )
+        open_tasks = list_sheet_tasks(
+            config,
+            batch_name=batch_name,
+            status="open",
+            limit=5000,
+        )
+        if pending_sheets == 0 and not open_tasks:
+            return RunUntilReviewSummary(
+                target=batch_name,
+                batch_runs=batch_runs,
+                review_slice_runs=review_slice_runs,
+                pending_sheets=0,
+                open_sheet_tasks=0,
+                staged_photo_count=staged_photo_count,
+                blocked=False,
+                blocked_reason=None,
+                staging_csv_path=staging_csv_path,
+                dry_run=False,
+            )
+
+        progressed = False
+        if pending_sheets > 0:
+            process_summary = run_batch(
+                config,
+                batch_name=batch_name,
+                sheet_id=None,
+                limit=None,
+                fast_mode=fast_mode,
+                dry_run=False,
+            )
+            batch_runs += 1
+            if process_summary.sheets_processed > 0 or process_summary.photos_processed > 0:
+                progressed = True
+
+        open_tasks = list_sheet_tasks(
+            config,
+            batch_name=batch_name,
+            status="open",
+            limit=5000,
+        )
+        if open_tasks:
+            slice_summary = run_review_slice(
+                config,
+                batch_name=batch_name,
+                limit=review_slice_limit,
+                dry_run=False,
+            )
+            review_slice_runs += 1
+            staged_photo_count = slice_summary.staged_photo_count
+            if slice_summary.actionable_tasks > 0 or slice_summary.photos_processed > 0:
+                progressed = True
+            elif pending_sheets == 0:
+                blocked = True
+                blocked_reason = "open sheet review tasks remain without photo detections"
+                break
+
+        if not progressed:
+            blocked = True
+            blocked_reason = "no further automatic progress was possible"
+            break
+
+    with connect(config) as conn:
+        remaining_pending = count_sheet_scans_by_status(
+            conn,
+            batch_name=batch_name,
+            status=SHEET_STATUS_INGESTED,
+        )
+    remaining_open_tasks = len(
+        list_sheet_tasks(
+            config,
+            batch_name=batch_name,
+            status="open",
+            limit=5000,
+        )
+    )
+    return RunUntilReviewSummary(
+        target=batch_name,
+        batch_runs=batch_runs,
+        review_slice_runs=review_slice_runs,
+        pending_sheets=remaining_pending,
+        open_sheet_tasks=remaining_open_tasks,
+        staged_photo_count=staged_photo_count,
+        blocked=blocked,
+        blocked_reason=blocked_reason,
+        staging_csv_path=staging_csv_path,
+        dry_run=False,
     )
