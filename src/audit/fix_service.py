@@ -37,6 +37,8 @@ ROTATION_BY_ISSUE = {
     "R180": 180,
     "FLIP": 180,
 }
+SPLIT_ISSUES = {"MERGE", "CROP", "DUP"}
+SUPPORTED_ISSUES = set(ROTATION_BY_ISSUE) | SPLIT_ISSUES | {"SKEW"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,56 +93,24 @@ def apply_export_audit_fixes(
     fixed_count = 0
     unresolved_count = 0
     created_photo_count = 0
-    export_width, export_height, export_profile = resolve_frame_export_request(
-        preset_name="auto",
-        width_px=None,
-        height_px=None,
-        profile_name=None,
-    )
 
     for task in tasks:
-        issue = str(task.payload_json.get("issue", "")).strip().upper()
+        issue_codes = _task_issue_codes(task)
         note = str(task.payload_json.get("notes", "")).strip() or None
-        try:
-            if issue in ROTATION_BY_ISSUE:
-                _apply_rotation_fix(
-                    config,
-                    task=task,
-                    rotation_degrees=ROTATION_BY_ISSUE[issue],
-                    note=note,
-                    export_width=export_width,
-                    export_height=export_height,
-                    export_profile=export_profile,
-                )
-                fixed_count += 1
-                continue
-            if issue in {"MERGE", "CROP", "DUP"}:
-                created_photo_count += _apply_split_fix(
-                    config,
-                    task=task,
-                    note=note,
-                    export_width=export_width,
-                    export_height=export_height,
-                    export_profile=export_profile,
-                )
-                fixed_count += 1
-                continue
-            if issue == "SKEW":
-                _apply_skew_fix(
-                    config,
-                    task=task,
-                    note=note,
-                    export_width=export_width,
-                    export_height=export_height,
-                    export_profile=export_profile,
-                )
-                fixed_count += 1
-                continue
-        except ValueError:
+        if not issue_codes or not _issue_codes_supported(issue_codes):
             unresolved_count += 1
             continue
 
-        unresolved_count += 1
+        try:
+            created_photo_count += _apply_issue_codes(
+                config,
+                task=task,
+                issue_codes=issue_codes,
+                note=note,
+            )
+            fixed_count += 1
+        except ValueError:
+            unresolved_count += 1
 
     return ExportAuditFixSummary(
         fixed_count=fixed_count,
@@ -151,71 +121,92 @@ def apply_export_audit_fixes(
 
 
 def _is_supported_issue(task: ReviewTask) -> bool:
-    issue = str(task.payload_json.get("issue", "")).strip().upper()
-    return issue in ROTATION_BY_ISSUE or issue in {"MERGE", "CROP", "DUP", "SKEW"}
+    issue_codes = _task_issue_codes(task)
+    return bool(issue_codes) and _issue_codes_supported(issue_codes)
 
-
-def _apply_rotation_fix(
+def _apply_issue_codes(
     config: AppConfig,
     *,
     task: ReviewTask,
-    rotation_degrees: int,
+    issue_codes: list[str],
     note: str | None,
-    export_width: int,
-    export_height: int,
-    export_profile: str,
+    ) -> int:
+    current_photo_ids = [task.entity_id]
+    created_photo_count = 0
+    split_issue = next((issue for issue in issue_codes if issue in SPLIT_ISSUES), None)
+    if split_issue is not None:
+        current_photo_ids = _apply_split_fix(
+            config,
+            task=task,
+            note=note,
+        )
+        created_photo_count = max(0, len(current_photo_ids) - 1)
+
+    for issue in issue_codes:
+        if issue in SPLIT_ISSUES:
+            continue
+        if issue in ROTATION_BY_ISSUE:
+            for photo_id in current_photo_ids:
+                _apply_rotation_fix_to_photo(
+                    config,
+                    photo_id=photo_id,
+                    rotation_degrees=ROTATION_BY_ISSUE[issue],
+                )
+            continue
+        if issue == "SKEW":
+            for photo_id in current_photo_ids:
+                _apply_skew_fix_to_photo(
+                    config,
+                    photo_id=photo_id,
+                    note=note,
+                )
+
+    for photo_id in current_photo_ids:
+        resolve_orientation_review_for_photo(
+            config,
+            photo_id=photo_id,
+            action="fixed_via_export_audit",
+        )
+
+    export_action = "fix_crop" if split_issue is not None else "fix_skew" if "SKEW" in issue_codes else "fix_rotation"
+    resolve_export_audit_review(
+        config,
+        task_id=task.id,
+        export_action=export_action,
+        note=note,
+        dry_run=False,
+    )
+    return created_photo_count
+
+
+def _apply_rotation_fix_to_photo(
+    config: AppConfig,
+    *,
+    photo_id: int,
+    rotation_degrees: int,
 ) -> None:
-    del export_width, export_height, export_profile
-    staged_context = _get_staged_photo_context(config, task=task)
+    staged_context = _get_staged_photo_context(config, photo_id=photo_id)
     _apply_direct_transform(
         config,
         context=staged_context,
         transform=_rotate_image,
         transform_value=rotation_degrees,
     )
-    resolve_export_audit_review(
-        config,
-        task_id=task.id,
-        export_action="fix_rotation",
-        note=note,
-        dry_run=False,
-    )
-    resolve_orientation_review_for_photo(
-        config,
-        photo_id=task.entity_id,
-        action="fixed_via_export_audit",
-    )
 
 
-def _apply_skew_fix(
+def _apply_skew_fix_to_photo(
     config: AppConfig,
     *,
-    task: ReviewTask,
+    photo_id: int,
     note: str | None,
-    export_width: int,
-    export_height: int,
-    export_profile: str,
-) -> None:
+    ) -> None:
     forced_angle = _parse_forced_skew_angle(note)
-    del export_width, export_height, export_profile
-    staged_context = _get_staged_photo_context(config, task=task)
+    staged_context = _get_staged_photo_context(config, photo_id=photo_id)
     _apply_direct_transform(
         config,
         context=staged_context,
         transform=_deskew_image,
         transform_value=forced_angle,
-    )
-    resolve_export_audit_review(
-        config,
-        task_id=task.id,
-        export_action="fix_skew",
-        note=note,
-        dry_run=False,
-    )
-    resolve_orientation_review_for_photo(
-        config,
-        photo_id=task.entity_id,
-        action="fixed_via_export_audit",
     )
 
 
@@ -224,10 +215,14 @@ def _apply_split_fix(
     *,
     task: ReviewTask,
     note: str | None,
-    export_width: int,
-    export_height: int,
-    export_profile: str,
-) -> int:
+) -> list[int]:
+    del note
+    export_width, export_height, export_profile = resolve_frame_export_request(
+        preset_name="auto",
+        width_px=None,
+        height_px=None,
+        profile_name=None,
+    )
     context = _get_photo_repair_context(config, photo_id=task.entity_id)
     source_path = config.photos_root.parent / context.raw_crop_path
     image = cv2.imread(str(source_path))
@@ -270,15 +265,7 @@ def _apply_split_fix(
             profile_name=export_profile,
             dry_run=False,
         )
-
-    resolve_export_audit_review(
-        config,
-        task_id=task.id,
-        export_action="fix_crop",
-        note=note,
-        dry_run=False,
-    )
-    return len(new_photo_ids)
+    return all_photo_ids
 
 
 def _get_photo_repair_context(config: AppConfig, *, photo_id: int) -> PhotoRepairContext:
@@ -303,24 +290,20 @@ def _get_photo_repair_context(config: AppConfig, *, photo_id: int) -> PhotoRepai
     )
 
 
-def _get_staged_photo_context(config: AppConfig, *, task: ReviewTask) -> StagedPhotoContext:
+def _get_staged_photo_context(config: AppConfig, *, photo_id: int) -> StagedPhotoContext:
     with connect(config) as conn:
-        photo = get_photo_record(conn, photo_id=task.entity_id)
+        photo = get_photo_record(conn, photo_id=photo_id)
         artifact_path = get_photo_artifact_path(
             conn,
-            photo_id=task.entity_id,
+            photo_id=photo_id,
             artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
         )
 
     if artifact_path is None:
-        payload_export_path = str(task.payload_json.get("export_path", "")).strip()
-        if payload_export_path:
-            artifact_path = Path(payload_export_path)
-    if artifact_path is None:
-        raise ValueError(f"Photo {task.entity_id} does not have a staged export to repair.")
+        raise ValueError(f"Photo {photo_id} does not have a staged export to repair.")
 
     return StagedPhotoContext(
-        photo_id=task.entity_id,
+        photo_id=photo_id,
         working_path=photo.working_path,
         staging_path=artifact_path,
     )
@@ -461,6 +444,34 @@ def _staging_profile_for_image(image) -> str:
     if height > width:
         return STAGING_PORTRAIT_PROFILE
     return STAGING_LANDSCAPE_PROFILE
+
+
+def _task_issue_codes(task: ReviewTask) -> list[str]:
+    payload_codes = task.payload_json.get("issue_codes")
+    if isinstance(payload_codes, list):
+        codes: list[str] = []
+        for value in payload_codes:
+            code = str(value).strip().upper()
+            if not code or code in codes:
+                continue
+            codes.append(code)
+        if codes:
+            return codes
+
+    raw_issue = str(task.payload_json.get("issue", "")).strip()
+    if not raw_issue:
+        return []
+    codes = []
+    for value in re.split(r"[,;\n]+", raw_issue):
+        code = value.strip().upper()
+        if not code or code in codes:
+            continue
+        codes.append(code)
+    return codes
+
+
+def _issue_codes_supported(issue_codes: list[str]) -> bool:
+    return all(issue in SUPPORTED_ISSUES for issue in issue_codes)
 
 
 def _rotate_image(image, rotation_degrees: int | float | None):
