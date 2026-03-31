@@ -262,6 +262,7 @@ def run_until_review(
             if process_summary.sheets_processed > 0 or process_summary.photos_processed > 0:
                 progressed = True
 
+        LOGGER.info("pipeline_batch_stage_start batch=%s stage=audit_exports", batch_name)
         audit_summary = run_export_audit(
             config,
             batch_name=batch_name,
@@ -273,6 +274,11 @@ def run_until_review(
             dry_run=False,
         )
         staged_photo_count = audit_summary.audited_count
+        LOGGER.info(
+            "pipeline_batch_stage_complete batch=%s stage=audit_exports staged_photo_count=%s",
+            batch_name,
+            staged_photo_count,
+        )
 
         if not progressed:
             blocked = True
