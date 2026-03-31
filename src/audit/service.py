@@ -263,6 +263,7 @@ def _target_name(
 def _write_audit_csv(csv_path: Path, findings: list[ExportAuditFinding]) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     preserved_manual_fields = _load_existing_manual_fields(csv_path)
+    sorted_findings = sorted(findings, key=lambda finding: finding.export_path.name)
     fieldnames = [
         "row_type",
         "export_folder",
@@ -284,7 +285,7 @@ def _write_audit_csv(csv_path: Path, findings: list[ExportAuditFinding]) -> None
     with csv_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
-        for finding in findings:
+        for finding in sorted_findings:
             preserved = preserved_manual_fields.get(str(finding.photo_id), {})
             writer.writerow(
                 {
