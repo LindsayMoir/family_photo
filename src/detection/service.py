@@ -33,6 +33,7 @@ def run_detection(
     sheet_id: int | None = None,
     limit: int | None = None,
     fast_mode: bool = False,
+    enable_ocr: bool = False,
     dry_run: bool,
 ) -> DetectionRunSummary:
     """Run the first-pass photo detection pipeline."""
@@ -55,10 +56,15 @@ def run_detection(
 
     if dry_run:
         for sheet in sheets:
+            analysis_result = detect_sheet_regions(
+                sheet.original_path,
+                fast_mode=fast_mode,
+                enable_ocr=enable_ocr,
+            )
             candidates = _materialize_region_outputs(
                 config.photos_root,
                 sheet,
-                detect_sheet_regions(sheet.original_path, fast_mode=fast_mode),
+                analysis_result.candidates,
                 write_files=False,
             )
             review_required, review_reason = _review_decision(
@@ -82,10 +88,15 @@ def run_detection(
         with connect(config) as conn:
             for sheet in sheets:
                 _cleanup_region_outputs(config.photos_root, sheet)
+                analysis_result = detect_sheet_regions(
+                    sheet.original_path,
+                    fast_mode=fast_mode,
+                    enable_ocr=enable_ocr,
+                )
                 candidates = _materialize_region_outputs(
                     config.photos_root,
                     sheet,
-                    detect_sheet_regions(sheet.original_path, fast_mode=fast_mode),
+                    analysis_result.candidates,
                     write_files=True,
                 )
                 review_required, review_reason = _review_decision(
@@ -110,6 +121,7 @@ def run_detection(
                     review_required=review_required,
                     review_reason=review_reason,
                     preview_path=str(preview_path) if preview_path is not None else None,
+                    ocr_request_reason=analysis_result.ocr_request_reason,
                 )
                 detection_results.append(
                     SheetDetectionResult(

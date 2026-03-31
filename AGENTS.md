@@ -177,6 +177,18 @@ When debugging:
 
 ---
 
+## SESSION HANDOFF
+
+For non-trivial work in this repository, read `SESSION_STATUS.md` at the repo root before making changes.
+
+Purpose:
+
+* preserve current debugging context across Codex restarts
+* avoid repeating investigation work
+* resume the active pipeline/debugging thread safely
+
+---
+
 ## SELF-REVIEW REQUIREMENT (MANDATORY)
 
 Do NOT output first draft.

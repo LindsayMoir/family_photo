@@ -103,6 +103,7 @@ def replace_detections(
     review_required: bool,
     review_reason: str | None,
     preview_path: str | None,
+    ocr_request_reason: str | None = None,
 ) -> int:
     """Replace the detection rows for a sheet scan."""
     candidate_list = list(candidates)
@@ -113,6 +114,13 @@ def replace_detections(
     )
 
     with conn.cursor() as cur:
+        cur.execute(
+            """
+            DELETE FROM ocr_requests
+            WHERE sheet_scan_id = %s
+            """,
+            (sheet_scan_id,),
+        )
         cur.execute(
             """
             DELETE FROM review_tasks
@@ -254,6 +262,19 @@ def replace_detections(
                         }
                     ),
                 ),
+            )
+
+        if ocr_request_reason is not None:
+            cur.execute(
+                """
+                INSERT INTO ocr_requests (
+                    sheet_scan_id,
+                    status,
+                    request_reason
+                )
+                VALUES (%s, 'pending', %s)
+                """,
+                (sheet_scan_id, ocr_request_reason),
             )
 
     return len(candidate_list)

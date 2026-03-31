@@ -6,7 +6,13 @@ import argparse
 import logging
 from pathlib import Path
 import sys
+import threading
+import time
 from typing import Sequence
+
+SRC_DIR = Path(__file__).resolve().parent
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
 
 from app_logging import configure_logging
 from audit.import_service import import_audit_csv
@@ -45,6 +51,95 @@ from review.service import (
 
 
 LOGGER = logging.getLogger(__name__)
+HEARTBEAT_INTERVAL_SECONDS = 30.0
+STATUS_TRACKED_COMMANDS = {
+    "ingest",
+    "detect",
+    "process",
+    "run-batch",
+    "run-next-slice",
+    "run-until-review",
+    "crop",
+    "deskew",
+    "orient",
+    "enhance",
+    "export-frame",
+    "audit-exports",
+    "import-audit-csv",
+    "promote-exports",
+}
+
+
+class CommandStatusReporter:
+    """Emit terminal-visible lifecycle status for long-running commands."""
+
+    def __init__(
+        self,
+        *,
+        command_name: str,
+        target: str | None,
+        enabled: bool,
+        heartbeat_interval_seconds: float = HEARTBEAT_INTERVAL_SECONDS,
+    ) -> None:
+        self.command_name = command_name
+        self.target = target
+        self.enabled = enabled
+        self.heartbeat_interval_seconds = heartbeat_interval_seconds
+        self._started_at: float | None = None
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._started_at = time.monotonic()
+        _print_status_line("started", command_name=self.command_name, target=self.target)
+        self._thread = threading.Thread(target=self._heartbeat_loop, name="command-heartbeat", daemon=True)
+        self._thread.start()
+
+    def complete(self) -> None:
+        if not self.enabled:
+            return
+        elapsed_seconds = self._stop()
+        _print_status_line(
+            "completed",
+            command_name=self.command_name,
+            target=self.target,
+            elapsed_seconds=f"{elapsed_seconds:.1f}",
+        )
+
+    def fail(self, exc: BaseException, *, failure_kind: str) -> None:
+        if not self.enabled:
+            return
+        elapsed_seconds = self._stop()
+        _print_status_line(
+            "failed",
+            command_name=self.command_name,
+            target=self.target,
+            elapsed_seconds=f"{elapsed_seconds:.1f}",
+            failure_kind=failure_kind,
+            error_type=type(exc).__name__,
+            error_message=str(exc).strip() or repr(exc),
+        )
+
+    def _stop(self) -> float:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.2)
+            self._thread = None
+        if self._started_at is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._started_at)
+
+    def _heartbeat_loop(self) -> None:
+        while not self._stop_event.wait(self.heartbeat_interval_seconds):
+            elapsed_seconds = 0.0 if self._started_at is None else max(0.0, time.monotonic() - self._started_at)
+            LOGGER.info(
+                "status=running command=%s target=%s elapsed_seconds=%.1f",
+                self.command_name,
+                self.target or "",
+                elapsed_seconds,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use faster printed-only OCR during detection.",
     )
+    detect_parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Enable OCR during detection. Disabled by default.",
+    )
 
     process_parser = subparsers.add_parser(
         "process",
@@ -103,6 +203,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use faster printed-only OCR during detection.",
     )
+    process_parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Enable OCR during detection. Disabled by default.",
+    )
 
     run_batch_parser = subparsers.add_parser(
         "run-batch",
@@ -121,6 +226,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fast",
         action="store_true",
         help="Use faster printed-only OCR during detection.",
+    )
+    run_batch_parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Enable OCR during detection. Disabled by default.",
     )
 
     run_next_slice_parser = subparsers.add_parser(
@@ -151,6 +261,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--fast",
         action="store_true",
         help="Use faster printed-only OCR during detection.",
+    )
+    run_until_review_parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Enable OCR during detection. Disabled by default.",
     )
 
     crop_parser = subparsers.add_parser("crop", help="Promote accepted photo detections into photo records.")
@@ -429,21 +544,49 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI."""
     parser = build_parser()
     args = parser.parse_args(argv)
+    reporter = CommandStatusReporter(
+        command_name=args.command,
+        target=_command_target(args),
+        enabled=args.command in STATUS_TRACKED_COMMANDS,
+    )
 
     try:
         config = load_config()
     except ConfigError as exc:
         parser.exit(status=2, message=f"Configuration error: {exc}\n")
 
-    configure_logging(config.log_level)
+    log_path = configure_logging(
+        config.log_level,
+        write_run_log=args.command in STATUS_TRACKED_COMMANDS,
+    )
+    if args.command in STATUS_TRACKED_COMMANDS:
+        LOGGER.info(
+            "command_started command=%s target=%s",
+            args.command,
+            _command_target(args) or "",
+        )
     LOGGER.debug("Loaded config for environment=%s", config.environment)
+    if log_path is not None:
+        print(f"log_path={log_path}", flush=True)
 
+    reporter.start()
     try:
-        return dispatch_command(args, config)
+        exit_code = dispatch_command(args, config)
+        reporter.complete()
+        return exit_code
+    except KeyboardInterrupt as exc:
+        reporter.fail(exc, failure_kind="interrupted")
+        parser.exit(status=130, message="Interrupted by user.\n")
     except ValueError as exc:
+        reporter.fail(exc, failure_kind="argument_error")
         parser.exit(status=2, message=f"Argument error: {exc}\n")
     except RuntimeError as exc:
+        reporter.fail(exc, failure_kind="runtime_error")
         parser.exit(status=1, message=f"Runtime error: {exc}\n")
+    except Exception as exc:
+        LOGGER.exception("Unhandled error while running command '%s'.", args.command)
+        reporter.fail(exc, failure_kind="unhandled_error")
+        parser.exit(status=1, message=f"Unhandled error: {exc}\n")
 
 
 def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
@@ -465,6 +608,7 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             sheet_id=args.sheet_id,
             limit=args.limit,
             fast_mode=args.fast,
+            enable_ocr=args.ocr,
             dry_run=args.dry_run,
         )
         return 0
@@ -475,6 +619,7 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             sheet_id=args.sheet_id,
             limit=args.limit,
             fast_mode=args.fast,
+            enable_ocr=args.ocr,
             dry_run=args.dry_run,
         )
         return 0
@@ -485,6 +630,7 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             sheet_id=args.sheet_id,
             limit=args.limit,
             fast_mode=args.fast,
+            enable_ocr=args.ocr,
             dry_run=args.dry_run,
         )
         return 0
@@ -502,6 +648,7 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             batch_name=args.batch,
             review_slice_limit=args.review_slice_limit,
             fast_mode=args.fast,
+            enable_ocr=args.ocr,
             dry_run=args.dry_run,
         )
         return 0
@@ -641,6 +788,7 @@ def _handle_detect(
     sheet_id: int | None,
     limit: int | None,
     fast_mode: bool,
+    enable_ocr: bool,
     dry_run: bool,
 ) -> None:
     result = run_detection(
@@ -649,12 +797,14 @@ def _handle_detect(
         sheet_id=sheet_id,
         limit=limit,
         fast_mode=fast_mode,
+        enable_ocr=enable_ocr,
         dry_run=dry_run,
     )
     print("command=detect")
     print(f"target={result.target}")
     print(f"dry_run={str(result.dry_run).lower()}")
     print(f"fast_mode={str(fast_mode).lower()}")
+    print(f"ocr_enabled={str(enable_ocr).lower()}")
     print(f"processed_count={result.processed_count}")
     print(f"detected_count={result.detected_count}")
     print(f"review_required_count={result.review_required_count}")
@@ -667,6 +817,7 @@ def _handle_process(
     sheet_id: int | None,
     limit: int | None,
     fast_mode: bool,
+    enable_ocr: bool,
     dry_run: bool,
 ) -> None:
     result = run_process(
@@ -675,12 +826,14 @@ def _handle_process(
         sheet_id=sheet_id,
         limit=limit,
         fast_mode=fast_mode,
+        enable_ocr=enable_ocr,
         dry_run=dry_run,
     )
     print("command=process")
     print(f"target={result.target}")
     print(f"dry_run={str(result.dry_run).lower()}")
     print(f"fast_mode={str(fast_mode).lower()}")
+    print(f"ocr_enabled={str(enable_ocr).lower()}")
     print(f"sheets_processed={result.sheets_processed}")
     print(f"photos_processed={result.photos_processed}")
     print(f"review_required_sheets={result.review_required_sheets}")
@@ -693,6 +846,7 @@ def _handle_run_batch(
     sheet_id: int | None,
     limit: int | None,
     fast_mode: bool,
+    enable_ocr: bool,
     dry_run: bool,
 ) -> None:
     if dry_run:
@@ -704,6 +858,7 @@ def _handle_run_batch(
                 dry_run=True,
                 notes=(
                     f"fast_mode={str(fast_mode).lower()}",
+                    f"ocr_enabled={str(enable_ocr).lower()}",
                     "run detect, crop, deskew, orient, enhance, and export-frame into staging",
                     "show the next blocking review task when manual input is required",
                 ),
@@ -717,12 +872,14 @@ def _handle_run_batch(
         sheet_id=sheet_id,
         limit=limit,
         fast_mode=fast_mode,
+        enable_ocr=enable_ocr,
         dry_run=dry_run,
     )
     print("command=run-batch")
     print(f"target={result.target}")
     print(f"dry_run={str(result.dry_run).lower()}")
     print(f"fast_mode={str(fast_mode).lower()}")
+    print(f"ocr_enabled={str(enable_ocr).lower()}")
     print(f"sheets_processed={result.sheets_processed}")
     print(f"photos_processed={result.photos_processed}")
     print(f"review_required_sheets={result.review_required_sheets}")
@@ -791,6 +948,7 @@ def _handle_run_until_review(
     batch_name: str,
     review_slice_limit: int,
     fast_mode: bool,
+    enable_ocr: bool,
     dry_run: bool,
 ) -> None:
     if dry_run:
@@ -802,6 +960,7 @@ def _handle_run_until_review(
                 notes=(
                     f"review_slice_limit={review_slice_limit}",
                     f"fast_mode={str(fast_mode).lower()}",
+                    f"ocr_enabled={str(enable_ocr).lower()}",
                     "keep processing ingested sheets and auto-advancing actionable review slices",
                     "stop only at a fresh staging CSV handoff or a true non-actionable blocker",
                 ),
@@ -814,11 +973,13 @@ def _handle_run_until_review(
         batch_name=batch_name,
         fast_mode=fast_mode,
         review_slice_limit=review_slice_limit,
+        enable_ocr=enable_ocr,
         dry_run=False,
     )
     print("command=run-until-review")
     print(f"target={result.target}")
     print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"ocr_enabled={str(enable_ocr).lower()}")
     print(f"batch_runs={result.batch_runs}")
     print(f"review_slice_runs={result.review_slice_runs}")
     print(f"pending_sheets={result.pending_sheets}")
@@ -1441,6 +1602,46 @@ def _print_run_batch_next_actions(task_type: str) -> None:
         return
     print(f"next_action=review task type {task_type}")
     print("next_command=PYTHONPATH=src python3 -m cli review show --task-id <task_id>")
+
+
+def _command_target(args: argparse.Namespace) -> str | None:
+    if getattr(args, "batch", None) is not None:
+        return str(args.batch)
+    if getattr(args, "sheet_id", None) is not None:
+        return f"sheet_id={args.sheet_id}"
+    if getattr(args, "photo_id", None) is not None:
+        return f"photo_id={args.photo_id}"
+    if getattr(args, "task_id", None) is not None:
+        return f"task_id={args.task_id}"
+    if getattr(args, "input", None) is not None:
+        return str(args.input)
+    if args.command == "review":
+        return f"review:{getattr(args, 'review_command', 'unknown')}"
+    return None
+
+
+def _print_status_line(
+    status: str,
+    *,
+    command_name: str,
+    target: str | None = None,
+    elapsed_seconds: str | None = None,
+    failure_kind: str | None = None,
+    error_type: str | None = None,
+    error_message: str | None = None,
+) -> None:
+    print(f"status={status}", flush=True)
+    print(f"command_name={command_name}", flush=True)
+    if target:
+        print(f"command_target={target}", flush=True)
+    if elapsed_seconds is not None:
+        print(f"elapsed_seconds={elapsed_seconds}", flush=True)
+    if failure_kind is not None:
+        print(f"failure_kind={failure_kind}", flush=True)
+    if error_type is not None:
+        print(f"error_type={error_type}", flush=True)
+    if error_message is not None:
+        print(f"error_message={error_message}", flush=True)
 
 
 def _print_plan(plan: CommandPlan) -> None:

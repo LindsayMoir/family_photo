@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 
 from audit.service import run_export_audit
 from config import AppConfig
@@ -26,6 +27,9 @@ from review.service import (
     get_task_summary,
     list_sheet_tasks,
 )
+
+LOGGER = logging.getLogger(__name__)
+REVIEW_SLICE_TASK_SCAN_LIMIT = 100
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +94,7 @@ def run_process(
     sheet_id: int | None,
     limit: int | None,
     fast_mode: bool = False,
+    enable_ocr: bool = False,
     dry_run: bool,
 ) -> ProcessSummary:
     """Run the current pipeline across one sheet or a batch of sheets."""
@@ -110,26 +115,40 @@ def run_process(
     review_required_sheets = 0
 
     for sheet in sheets:
+        LOGGER.info("pipeline_sheet_start sheet_id=%s batch=%s stage=detection", sheet.id, sheet.batch_name)
         detection_result = run_detection(
             config,
             sheet_id=sheet.id,
             fast_mode=fast_mode,
+            enable_ocr=enable_ocr,
             dry_run=dry_run,
+        )
+        LOGGER.info(
+            "pipeline_sheet_detection_complete sheet_id=%s detected_count=%s review_required_count=%s",
+            sheet.id,
+            detection_result.detected_count,
+            detection_result.review_required_count,
         )
 
         if detection_result.review_required_count > 0 or detection_result.detected_count == 0:
+            LOGGER.info("pipeline_sheet_blocked sheet_id=%s reason=review_required_or_no_detections", sheet.id)
             review_required_sheets += 1
             continue
 
+        LOGGER.info("pipeline_sheet_stage_start sheet_id=%s stage=crop", sheet.id)
         run_crop(config, sheet_id=sheet.id, dry_run=dry_run)
 
         with connect(config) as conn:
             photo_ids = list_photo_ids_for_sheet(conn, sheet_id=sheet.id)
 
         for photo_id in photo_ids:
+            LOGGER.info("pipeline_photo_stage_start photo_id=%s stage=deskew", photo_id)
             run_deskew(config, photo_id=photo_id, dry_run=dry_run)
+            LOGGER.info("pipeline_photo_stage_start photo_id=%s stage=orientation", photo_id)
             run_orientation(config, photo_id=photo_id, dry_run=dry_run)
+            LOGGER.info("pipeline_photo_stage_start photo_id=%s stage=enhance", photo_id)
             run_enhancement(config, photo_id=photo_id, dry_run=dry_run)
+            LOGGER.info("pipeline_photo_complete photo_id=%s", photo_id)
             photos_processed += 1
 
     target = batch_name if batch_name is not None else f"sheet_id={sheet_id}"
@@ -149,6 +168,7 @@ def run_batch(
     sheet_id: int | None,
     limit: int | None,
     fast_mode: bool,
+    enable_ocr: bool,
     dry_run: bool,
 ) -> RunBatchSummary:
     """Advance the pipeline, export ready photos, and report the next blocking review task."""
@@ -158,6 +178,7 @@ def run_batch(
         sheet_id=sheet_id,
         limit=limit,
         fast_mode=fast_mode,
+        enable_ocr=enable_ocr,
         dry_run=dry_run,
     )
 
@@ -229,12 +250,13 @@ def run_review_slice(
         config,
         batch_name=batch_name,
         status="open",
-        limit=limit,
+        limit=REVIEW_SLICE_TASK_SCAN_LIMIT,
     )
     if not open_tasks:
         raise ValueError(f"No open sheet review tasks found for batch '{batch_name}'.")
 
     actionable_tasks: list[tuple[int, int, list[int]]] = []
+    requested_task_count = min(len(open_tasks), limit)
     skipped_tasks_without_photo_detections = 0
 
     for task in open_tasks:
@@ -250,11 +272,13 @@ def run_review_slice(
             skipped_tasks_without_photo_detections += 1
             continue
         actionable_tasks.append((task.id, task.entity_id, detection_ids))
+        if len(actionable_tasks) >= limit:
+            break
 
     if dry_run:
         return RunReviewSliceSummary(
             target=batch_name,
-            requested_tasks=len(open_tasks),
+            requested_tasks=requested_task_count,
             actionable_tasks=len(actionable_tasks),
             skipped_tasks_without_photo_detections=skipped_tasks_without_photo_detections,
             photos_processed=0,
@@ -272,6 +296,12 @@ def run_review_slice(
 
     photos_processed = 0
     for task_id, sheet_id, detection_ids in actionable_tasks:
+        LOGGER.info(
+            "review_slice_task_start task_id=%s sheet_id=%s detection_count=%s",
+            task_id,
+            sheet_id,
+            len(detection_ids),
+        )
         accept_detections(
             config,
             task_id=task_id,
@@ -284,9 +314,13 @@ def run_review_slice(
             photo_ids = list_photo_ids_for_sheet(conn, sheet_id=sheet_id)
 
         for photo_id in photo_ids:
+            LOGGER.info("review_slice_photo_stage_start photo_id=%s stage=deskew", photo_id)
             run_deskew(config, photo_id=photo_id, dry_run=False)
+            LOGGER.info("review_slice_photo_stage_start photo_id=%s stage=orientation", photo_id)
             run_orientation(config, photo_id=photo_id, dry_run=False)
+            LOGGER.info("review_slice_photo_stage_start photo_id=%s stage=enhance", photo_id)
             run_enhancement(config, photo_id=photo_id, dry_run=False)
+            LOGGER.info("review_slice_photo_stage_start photo_id=%s stage=frame_export", photo_id)
             run_frame_export(
                 config,
                 batch_name=None,
@@ -299,6 +333,7 @@ def run_review_slice(
                 dry_run=False,
             )
             photos_processed += 1
+        LOGGER.info("review_slice_task_complete task_id=%s sheet_id=%s", task_id, sheet_id)
 
     audit_summary = run_export_audit(
         config,
@@ -313,7 +348,7 @@ def run_review_slice(
 
     return RunReviewSliceSummary(
         target=batch_name,
-        requested_tasks=len(open_tasks),
+        requested_tasks=requested_task_count,
         actionable_tasks=len(actionable_tasks),
         skipped_tasks_without_photo_detections=skipped_tasks_without_photo_detections,
         photos_processed=photos_processed,
@@ -329,6 +364,7 @@ def run_until_review(
     batch_name: str,
     fast_mode: bool,
     review_slice_limit: int,
+    enable_ocr: bool,
     dry_run: bool,
 ) -> RunUntilReviewSummary:
     """Keep processing one batch until a true blocker or a fresh staging handoff appears."""
@@ -391,6 +427,7 @@ def run_until_review(
                 sheet_id=None,
                 limit=None,
                 fast_mode=fast_mode,
+                enable_ocr=enable_ocr,
                 dry_run=False,
             )
             batch_runs += 1

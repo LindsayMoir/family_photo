@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from contextlib import contextmanager
+
+from detection.models import DetectionRunSummary, SheetScanRecord
+from pipeline.service import run_process
+
+
+@contextmanager
+def _unused_connect(_config):
+    yield object()
+
+
+def test_run_process_advances_detected_sheet_without_touching_database(
+    app_config,
+    monkeypatch,
+) -> None:
+    sheet = SheetScanRecord(
+        id=11,
+        batch_name="batch-a",
+        original_path=app_config.photos_root / "sheet_11.jpg",
+        width_px=1200,
+        height_px=900,
+    )
+    sheet.original_path.write_bytes(b"sheet")
+    stage_calls: list[tuple[str, int]] = []
+
+    monkeypatch.setattr("pipeline.service.connect", _unused_connect)
+    monkeypatch.setattr("pipeline.service.get_sheet_scans", lambda *args, **kwargs: [sheet])
+    monkeypatch.setattr(
+        "pipeline.service.run_detection",
+        lambda *args, **kwargs: DetectionRunSummary(
+            target="sheet_id=11",
+            processed_count=1,
+            detected_count=2,
+            review_required_count=0,
+            dry_run=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "pipeline.service.run_crop",
+        lambda *args, **kwargs: stage_calls.append(("crop", kwargs["sheet_id"])),
+    )
+    monkeypatch.setattr("pipeline.service.list_photo_ids_for_sheet", lambda *args, **kwargs: [101, 102])
+    monkeypatch.setattr(
+        "pipeline.service.run_deskew",
+        lambda *args, **kwargs: stage_calls.append(("deskew", kwargs["photo_id"])),
+    )
+    monkeypatch.setattr(
+        "pipeline.service.run_orientation",
+        lambda *args, **kwargs: stage_calls.append(("orientation", kwargs["photo_id"])),
+    )
+    monkeypatch.setattr(
+        "pipeline.service.run_enhancement",
+        lambda *args, **kwargs: stage_calls.append(("enhance", kwargs["photo_id"])),
+    )
+
+    summary = run_process(
+        app_config,
+        batch_name=None,
+        sheet_id=11,
+        limit=None,
+        fast_mode=False,
+        enable_ocr=False,
+        dry_run=True,
+    )
+
+    assert summary.target == "sheet_id=11"
+    assert summary.sheets_processed == 1
+    assert summary.photos_processed == 2
+    assert summary.review_required_sheets == 0
+    assert summary.dry_run is True
+    assert stage_calls == [
+        ("crop", 11),
+        ("deskew", 101),
+        ("orientation", 101),
+        ("enhance", 101),
+        ("deskew", 102),
+        ("orientation", 102),
+        ("enhance", 102),
+    ]
+
+
+def test_run_process_stops_after_review_required_detection(app_config, monkeypatch) -> None:
+    sheet = SheetScanRecord(
+        id=22,
+        batch_name="batch-b",
+        original_path=app_config.photos_root / "sheet_22.jpg",
+        width_px=1200,
+        height_px=900,
+    )
+    sheet.original_path.write_bytes(b"sheet")
+
+    monkeypatch.setattr("pipeline.service.connect", _unused_connect)
+    monkeypatch.setattr("pipeline.service.get_sheet_scans", lambda *args, **kwargs: [sheet])
+    monkeypatch.setattr(
+        "pipeline.service.run_detection",
+        lambda *args, **kwargs: DetectionRunSummary(
+            target="sheet_id=22",
+            processed_count=1,
+            detected_count=0,
+            review_required_count=1,
+            dry_run=True,
+        ),
+    )
+    monkeypatch.setattr(
+        "pipeline.service.run_crop",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("crop should not run")),
+    )
+
+    summary = run_process(
+        app_config,
+        batch_name=None,
+        sheet_id=22,
+        limit=None,
+        fast_mode=False,
+        enable_ocr=False,
+        dry_run=True,
+    )
+
+    assert summary.photos_processed == 0
+    assert summary.review_required_sheets == 1

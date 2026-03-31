@@ -20,6 +20,9 @@ handwriting-ocr = [
   "torch>=2.7.0",
   "transformers>=4.52.0",
 ]
+dev = [
+  "pytest>=8.0.0",
+]
 
 [project.scripts]
 family-photo = "cli:main"
@@ -29,3 +32,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

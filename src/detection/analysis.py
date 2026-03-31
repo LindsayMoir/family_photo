@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
@@ -35,7 +36,18 @@ WIDE_DUPLICATE_HALF_SIMILARITY = 0.83
 WIDE_DUPLICATE_MIN_OTHER_AREA_RATIO = 0.05
 
 
-def detect_sheet_regions(image_path: Path, *, fast_mode: bool = False) -> list[DetectionCandidate]:
+@dataclass(frozen=True, slots=True)
+class DetectionAnalysisResult:
+    candidates: list[DetectionCandidate]
+    ocr_request_reason: str | None = None
+
+
+def detect_sheet_regions(
+    image_path: Path,
+    *,
+    fast_mode: bool = False,
+    enable_ocr: bool = False,
+) -> DetectionAnalysisResult:
     """Detect photo and text regions in a sheet scan."""
     image = cv2.imread(str(image_path))
     if image is None:
@@ -43,6 +55,14 @@ def detect_sheet_regions(image_path: Path, *, fast_mode: bool = False) -> list[D
 
     photo_candidates = _detect_photo_candidates(image)
     photo_candidates = _subdivide_large_photo_candidates(image, photo_candidates)
+    if not enable_ocr:
+        if photo_candidates:
+            return DetectionAnalysisResult(candidates=photo_candidates[:MAX_OUTPUT_CANDIDATES])
+        return DetectionAnalysisResult(
+            candidates=[_full_image_photo_candidate(image)],
+            ocr_request_reason="ocr_disabled_requires_followup",
+        )
+
     text_candidates = _detect_text_candidates(image, photo_candidates, fast_mode=fast_mode)
 
     combined = list(photo_candidates)
@@ -51,7 +71,7 @@ def detect_sheet_regions(image_path: Path, *, fast_mode: bool = False) -> list[D
             combined.append(text_candidate)
 
     combined.sort(key=lambda candidate: candidate.confidence, reverse=True)
-    return combined[:MAX_OUTPUT_CANDIDATES]
+    return DetectionAnalysisResult(candidates=combined[:MAX_OUTPUT_CANDIDATES])
 
 
 def render_detection_preview(image_path: Path, candidates: list[DetectionCandidate], output_path: Path) -> Path:
@@ -144,6 +164,23 @@ def has_duplicate_wide_photo_candidate(
             if _crop_similarity(right_half, other_crop) >= WIDE_DUPLICATE_HALF_SIMILARITY:
                 return True
     return False
+
+
+def _full_image_photo_candidate(image: np.ndarray) -> DetectionCandidate:
+    height, width = image.shape[:2]
+    return DetectionCandidate(
+        region_type="photo",
+        contour_points=((0, 0), (width, 0), (width, height), (0, height)),
+        box_points=((0, 0), (width, 0), (width, height), (0, height)),
+        center_x=float(width / 2.0),
+        center_y=float(height / 2.0),
+        width=float(width),
+        height=float(height),
+        angle=0.0,
+        area_ratio=1.0,
+        rectangularity=1.0,
+        confidence=0.85,
+    )
 
 
 def _detect_photo_candidates(image: np.ndarray) -> list[DetectionCandidate]:
