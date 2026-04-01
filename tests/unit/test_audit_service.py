@@ -250,6 +250,53 @@ def test_write_audit_csv_preserves_manual_issue_over_model_default(tmp_path) -> 
     assert row["notes"] == "keep my note"
 
 
+def test_write_audit_csv_clears_preserved_manual_fields_after_recent_fix(
+    tmp_path,
+    app_config,
+    monkeypatch,
+) -> None:
+    csv_path = tmp_path / "export_audit.csv"
+    csv_path.write_text(
+        "\n".join(
+            [
+                "row_type,export_folder,export_filename,needs_help,issue,notes,review_priority,auto_rotation_suggestion,auto_rotation_confidence,audit_category,audit_reason,export_path,photo_id,batch_name,sheet_scan_id,crop_index",
+                "photo,landscape,photo_10.jpg,x,MERGE,stale flag,high,0,0.00,ok,,/tmp/photo_10.jpg,10,batch-a,20,1",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "audit.service._photo_ids_with_resolved_export_audit_fixes",
+        lambda config: {"10"},
+    )
+    findings = [
+        ExportAuditFinding(
+            photo_id=10,
+            batch_name="batch-a",
+            sheet_scan_id=20,
+            crop_index=1,
+            category="ok",
+            reason="no audit issue detected",
+            export_path=tmp_path / "staging" / "photo_10.jpg",
+            auto_rotation_suggestion=0,
+            auto_rotation_confidence=0.10,
+            review_priority="low",
+            suggested_issue=None,
+            suggested_issue_confidence=None,
+            suggested_issue_reason=None,
+        )
+    ]
+
+    _write_audit_csv(csv_path, findings, config=app_config)
+
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        row = next(row for row in csv.DictReader(handle) if row["row_type"] == "photo")
+
+    assert row["needs_help"] == ""
+    assert row["issue"] == ""
+    assert row["notes"] == ""
+
+
 def test_classify_record_uses_model_merge_decision(monkeypatch, tmp_path) -> None:
     raw_crop_path = tmp_path / "crop.jpg"
     raw_crop_path.write_bytes(b"placeholder")

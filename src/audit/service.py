@@ -41,6 +41,7 @@ AUTO_PREFILL_ISSUE_THRESHOLDS: dict[str, float] = {
     "R180": 0.90,
 }
 DEFAULT_AUDIT_ORIENTATION_WORKERS = 6
+RESOLVED_EXPORT_AUDIT_FIX_ACTIONS = ("fix_crop", "fix_rotation", "fix_skew")
 ISSUE_CODEBOOK: tuple[tuple[str, str], ...] = (
     ("RR90", "Rotate right 90 degrees."),
     ("RL90", "Rotate left 90 degrees."),
@@ -123,7 +124,7 @@ def run_export_audit(
     )
     if not dry_run:
         LOGGER.info("audit_stage_start stage=write_csv csv_path=%s", output_csv_path)
-        _write_audit_csv(output_csv_path, findings)
+        _write_audit_csv(output_csv_path, findings, config=config)
         LOGGER.info("audit_stage_complete stage=write_csv csv_path=%s", output_csv_path)
     return ExportAuditSummary(
         target=_target_name(batch_name=batch_name, sheet_id=sheet_id, photo_id=photo_id),
@@ -517,9 +518,15 @@ def _target_name(
     return "all_staging_exports"
 
 
-def _write_audit_csv(csv_path: Path, findings: list[ExportAuditFinding]) -> None:
+def _write_audit_csv(
+    csv_path: Path,
+    findings: list[ExportAuditFinding],
+    *,
+    config: AppConfig | None = None,
+) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
     preserved_manual_fields = _load_existing_manual_fields(csv_path)
+    fixed_photo_ids = _photo_ids_with_resolved_export_audit_fixes(config)
     sorted_findings = sorted(findings, key=lambda finding: finding.export_path.name)
     fieldnames = [
         "row_type",
@@ -546,7 +553,10 @@ def _write_audit_csv(csv_path: Path, findings: list[ExportAuditFinding]) -> None
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for finding in sorted_findings:
-            preserved = preserved_manual_fields.get(str(finding.photo_id), {})
+            photo_id = str(finding.photo_id)
+            preserved = preserved_manual_fields.get(photo_id, {})
+            if photo_id in fixed_photo_ids:
+                preserved = {}
             defaults = _default_manual_fields_for_finding(finding)
             writer.writerow(
                 {
@@ -605,6 +615,30 @@ def _load_existing_manual_fields(csv_path: Path) -> dict[str, dict[str, str]]:
                 "notes": row.get("notes", row.get("operator_notes", "")),
             }
     return manual_fields
+
+
+def _photo_ids_with_resolved_export_audit_fixes(
+    config: AppConfig | None,
+) -> set[str]:
+    if config is None:
+        return set()
+
+    with connect(config) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT DISTINCT entity_id
+                FROM review_tasks
+                WHERE task_type = 'review_export_audit'
+                  AND entity_type = 'photo'
+                  AND status = 'resolved'
+                  AND resolution_json ->> 'action' = ANY(%s)
+                  AND resolved_at IS NOT NULL
+                """,
+                (list(RESOLVED_EXPORT_AUDIT_FIX_ACTIONS),),
+            )
+            rows = cur.fetchall()
+    return {str(row[0]) for row in rows}
 
 
 def _default_manual_fields_for_finding(finding: ExportAuditFinding) -> dict[str, str]:
