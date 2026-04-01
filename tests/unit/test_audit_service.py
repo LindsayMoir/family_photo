@@ -9,6 +9,7 @@ from audit.service import (
     _default_manual_fields_for_finding,
     _photo_id_from_staging_filename,
     _reconcile_staging_export_artifacts,
+    _resolve_orientation_decisions,
     _should_query_model_for_record,
     _should_auto_prefill_issue,
     _write_audit_csv,
@@ -305,3 +306,20 @@ def test_should_query_model_for_record_only_targets_strong_r180() -> None:
         category="ok",
         orientation_decision=type("Decision", (), {"rotation_degrees": 180, "confidence": 0.95})(),
     ) is False
+
+
+def test_resolve_orientation_decisions_maps_photo_ids(monkeypatch, tmp_path) -> None:
+    record_a = type("Record", (), {"photo_id": 10, "working_path": tmp_path / "a.jpg"})()
+    record_b = type("Record", (), {"photo_id": 20, "working_path": tmp_path / "b.jpg"})()
+
+    monkeypatch.setattr(
+        "audit.service.audit_orientation_image",
+        lambda path: f"decision:{path.name}",
+    )
+
+    decisions = _resolve_orientation_decisions([record_a, record_b])
+
+    assert decisions == {
+        10: "decision:a.jpg",
+        20: "decision:b.jpg",
+    }

@@ -143,3 +143,11 @@ def test_detect_parser_enables_ocr_when_requested() -> None:
     args = parser.parse_args(["detect", "--sheet-id", "12", "--ocr", "--dry-run"])
 
     assert args.ocr is True
+
+
+def test_audit_exports_parser_accepts_debug_flag() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["audit-exports", "--debug-audit", "--dry-run"])
+
+    assert args.debug_audit is True

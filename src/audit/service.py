@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import csv
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+import os
 from pathlib import Path
 import re
 from typing import Any
@@ -28,6 +30,7 @@ from photo_repository import (
     list_photo_artifact_paths,
     list_photo_ids,
 )
+import logging
 
 
 MERGED_SIMILARITY_THRESHOLD = 0.83
@@ -37,6 +40,7 @@ AMBIGUOUS_DETECTION_CONFIDENCE = 0.75
 AUTO_PREFILL_ISSUE_THRESHOLDS: dict[str, float] = {
     "R180": 0.90,
 }
+DEFAULT_AUDIT_ORIENTATION_WORKERS = 6
 ISSUE_CODEBOOK: tuple[tuple[str, str], ...] = (
     ("RR90", "Rotate right 90 degrees."),
     ("RL90", "Rotate left 90 degrees."),
@@ -55,6 +59,7 @@ ISSUE_CODEBOOK: tuple[tuple[str, str], ...] = (
     ("OTHER", "Custom issue. Explain in notes."),
 )
 _STAGING_EXPORT_FILENAME_RE = re.compile(r"^photo_(?P<photo_id>\d+)\.jpg$", re.IGNORECASE)
+LOGGER = logging.getLogger(__name__)
 
 
 def run_export_audit(
@@ -69,7 +74,9 @@ def run_export_audit(
     dry_run: bool,
 ) -> ExportAuditSummary:
     """Classify exported photos into operator-facing categories."""
+    debug_enabled = os.getenv("FAMILY_PHOTO_AUDIT_DEBUG", "").strip().lower() in {"1", "true", "yes"}
     if not dry_run:
+        LOGGER.info("audit_stage_start stage=stage_open_orientation_reviews")
         _stage_open_orientation_reviews(
             config,
             batch_name=batch_name,
@@ -77,8 +84,10 @@ def run_export_audit(
             photo_id=photo_id,
             limit=limit,
         )
+        LOGGER.info("audit_stage_complete stage=stage_open_orientation_reviews")
     with connect(config) as conn:
         if not dry_run:
+            LOGGER.info("audit_stage_start stage=reconcile_staging_artifacts")
             _reconcile_staging_export_artifacts(
                 conn,
                 config,
@@ -88,6 +97,8 @@ def run_export_audit(
                 limit=limit,
             )
             conn.commit()
+            LOGGER.info("audit_stage_complete stage=reconcile_staging_artifacts")
+        LOGGER.info("audit_stage_start stage=load_records")
         records = list_export_audit_records(
             conn,
             artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
@@ -96,8 +107,11 @@ def run_export_audit(
             photo_id=photo_id,
             limit=limit,
         )
+        LOGGER.info("audit_stage_complete stage=load_records record_count=%s", len(records))
 
+    LOGGER.info("audit_stage_start stage=classify_records debug=%s", str(debug_enabled).lower())
     findings = _classify_records(records, config=config)
+    LOGGER.info("audit_stage_complete stage=classify_records finding_count=%s", len(findings))
     if category is not None:
         findings = [finding for finding in findings if finding.category == category]
 
@@ -108,7 +122,9 @@ def run_export_audit(
         else config.photos_root / "exports" / "staging" / "export_audit.csv"
     )
     if not dry_run:
+        LOGGER.info("audit_stage_start stage=write_csv csv_path=%s", output_csv_path)
         _write_audit_csv(output_csv_path, findings)
+        LOGGER.info("audit_stage_complete stage=write_csv csv_path=%s", output_csv_path)
     return ExportAuditSummary(
         target=_target_name(batch_name=batch_name, sheet_id=sheet_id, photo_id=photo_id),
         audited_count=len(findings),
@@ -124,24 +140,43 @@ def _classify_records(
     *,
     config: AppConfig,
 ) -> list[ExportAuditFinding]:
+    debug_enabled = os.getenv("FAMILY_PHOTO_AUDIT_DEBUG", "").strip().lower() in {"1", "true", "yes"}
     by_sheet: dict[int, list[ExportAuditRecord]] = defaultdict(list)
     for record in records:
         by_sheet[record.sheet_scan_id].append(record)
     classified_rows: list[tuple[ExportAuditRecord, object, str, str]] = []
     candidate_model_paths: set[Path] = set()
+    LOGGER.info("audit_stage_start stage=resolve_orientation_decisions debug=%s", str(debug_enabled).lower())
+    orientation_by_photo_id = _resolve_orientation_decisions(
+        records,
+        executor_factory=_orientation_executor_factory(),
+    )
+    LOGGER.info("audit_stage_complete stage=resolve_orientation_decisions decision_count=%s", len(orientation_by_photo_id))
 
     for record in records:
+        if debug_enabled:
+            LOGGER.info("audit_record_start photo_id=%s export_path=%s", record.photo_id, record.export_path)
         siblings = [candidate for candidate in by_sheet[record.sheet_scan_id] if candidate.photo_id != record.photo_id]
-        orientation_decision = audit_orientation_image(record.working_path)
+        orientation_decision = orientation_by_photo_id[record.photo_id]
         category, reason = _classify_record(record, siblings, orientation_decision)
         classified_rows.append((record, orientation_decision, category, reason))
         if _should_query_model_for_record(category=category, orientation_decision=orientation_decision):
             candidate_model_paths.add(record.export_path)
+        if debug_enabled:
+            LOGGER.info(
+                "audit_record_complete photo_id=%s category=%s rotation=%s confidence=%.2f",
+                record.photo_id,
+                category,
+                orientation_decision.rotation_degrees,
+                orientation_decision.confidence,
+            )
 
+    LOGGER.info("audit_stage_start stage=resolve_export_issues candidate_count=%s", len(candidate_model_paths))
     suggestion_by_export_path = resolve_export_issues(
         config,
         image_paths=sorted(candidate_model_paths),
     )
+    LOGGER.info("audit_stage_complete stage=resolve_export_issues resolved_count=%s", len(suggestion_by_export_path))
 
     findings: list[ExportAuditFinding] = []
     for record, orientation_decision, category, reason in classified_rows:
@@ -169,6 +204,47 @@ def _classify_records(
 
     findings.sort(key=lambda item: (item.category, item.batch_name, item.sheet_scan_id, item.crop_index, item.photo_id))
     return findings
+
+
+def _resolve_orientation_decisions(records: list[ExportAuditRecord], executor_factory=ThreadPoolExecutor) -> dict[int, object]:
+    if not records:
+        return {}
+    debug_enabled = os.getenv("FAMILY_PHOTO_AUDIT_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+    workers = max(
+        1,
+        int(
+            os.getenv(
+                "FAMILY_PHOTO_AUDIT_ORIENTATION_WORKERS",
+                str(DEFAULT_AUDIT_ORIENTATION_WORKERS),
+            ).strip()
+            or DEFAULT_AUDIT_ORIENTATION_WORKERS
+        ),
+    )
+    decisions: dict[int, object] = {}
+    if debug_enabled:
+        for record in records:
+            LOGGER.info("audit_orientation_debug_start photo_id=%s working_path=%s", record.photo_id, record.working_path)
+            decisions[record.photo_id] = audit_orientation_image(record.working_path)
+            LOGGER.info("audit_orientation_debug_complete photo_id=%s", record.photo_id)
+        return decisions
+    executor_kwargs = {"max_workers": min(workers, len(records))}
+    if executor_factory is ThreadPoolExecutor:
+        executor_kwargs["thread_name_prefix"] = "audit-orient"
+    with executor_factory(**executor_kwargs) as executor:
+        future_to_photo_id = {
+            executor.submit(audit_orientation_image, record.working_path): record.photo_id
+            for record in records
+        }
+        for future in as_completed(future_to_photo_id):
+            photo_id = future_to_photo_id[future]
+            decisions[photo_id] = future.result()
+    return decisions
+
+
+def _orientation_executor_factory():
+    if os.getenv("PYTEST_CURRENT_TEST"):
+        return ThreadPoolExecutor
+    return ProcessPoolExecutor
 
 
 def _reconcile_staging_export_artifacts(

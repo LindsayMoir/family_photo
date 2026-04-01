@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from pathlib import Path
 import sys
 import threading
@@ -325,6 +326,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="Optional CSV output path. Defaults to photos/exports/staging/export_audit.csv.",
     )
+    audit_parser.add_argument(
+        "--debug-audit",
+        action="store_true",
+        help="Run audit-exports with sequential per-photo debug logging.",
+    )
 
     import_audit_parser = subparsers.add_parser(
         "import-audit-csv",
@@ -628,6 +634,7 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             limit=args.limit,
             category=args.category,
             csv_path=args.csv_path,
+            debug_audit=args.debug_audit,
             dry_run=args.dry_run,
         )
         return 0
@@ -1006,6 +1013,7 @@ def _handle_audit_exports(
     limit: int | None,
     category: str | None,
     csv_path: Path | None,
+    debug_audit: bool,
     dry_run: bool,
 ) -> None:
     if dry_run:
@@ -1031,16 +1039,26 @@ def _handle_audit_exports(
         )
         return
 
-    result = run_export_audit(
-        config,
-        batch_name=batch_name,
-        sheet_id=sheet_id,
-        photo_id=photo_id,
-        limit=limit,
-        category=category,
-        csv_path=csv_path,
-        dry_run=False,
-    )
+    previous_debug = os.environ.get("FAMILY_PHOTO_AUDIT_DEBUG")
+    if debug_audit:
+        os.environ["FAMILY_PHOTO_AUDIT_DEBUG"] = "1"
+    try:
+        result = run_export_audit(
+            config,
+            batch_name=batch_name,
+            sheet_id=sheet_id,
+            photo_id=photo_id,
+            limit=limit,
+            category=category,
+            csv_path=csv_path,
+            dry_run=False,
+        )
+    finally:
+        if debug_audit:
+            if previous_debug is None:
+                os.environ.pop("FAMILY_PHOTO_AUDIT_DEBUG", None)
+            else:
+                os.environ["FAMILY_PHOTO_AUDIT_DEBUG"] = previous_debug
     print("command=audit-exports")
     print(f"target={result.target}")
     print(f"dry_run={str(result.dry_run).lower()}")
