@@ -331,6 +331,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run audit-exports with sequential per-photo debug logging.",
     )
+    audit_parser.add_argument(
+        "--show-findings",
+        action="store_true",
+        help="Print per-photo audit findings after the summary.",
+    )
 
     import_audit_parser = subparsers.add_parser(
         "import-audit-csv",
@@ -635,6 +640,7 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             category=args.category,
             csv_path=args.csv_path,
             debug_audit=args.debug_audit,
+            show_findings=args.show_findings,
             dry_run=args.dry_run,
         )
         return 0
@@ -1014,6 +1020,7 @@ def _handle_audit_exports(
     category: str | None,
     csv_path: Path | None,
     debug_audit: bool,
+    show_findings: bool,
     dry_run: bool,
 ) -> None:
     if dry_run:
@@ -1065,11 +1072,16 @@ def _handle_audit_exports(
     print(f"audited_count={result.audited_count}")
     if result.csv_path is not None:
         print(f"csv_path={result.csv_path}")
+    print(f"finding_count={len(result.findings)}")
     for category_name in ("merged_detection", "rotation", "source_ambiguous", "ok"):
         if category_name in result.category_counts:
             print(f"category_count={category_name}:{result.category_counts[category_name]}")
     if not result.findings:
         print("audit_findings=none")
+        return
+    if not show_findings:
+        print("audit_findings=omitted")
+        print("hint=rerun with --show-findings to print per-photo findings")
         return
     print("category\tphoto_id\tsheet_id\tcrop_index\treason\texport_path")
     for finding in result.findings:

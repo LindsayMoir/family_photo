@@ -5,6 +5,7 @@ import argparse
 import pytest
 
 import cli
+from audit.models import ExportAuditFinding, ExportAuditSummary
 from config import AppConfig
 
 
@@ -151,3 +152,135 @@ def test_audit_exports_parser_accepts_debug_flag() -> None:
     args = parser.parse_args(["audit-exports", "--debug-audit", "--dry-run"])
 
     assert args.debug_audit is True
+
+
+def test_audit_exports_parser_accepts_show_findings_flag() -> None:
+    parser = cli.build_parser()
+
+    args = parser.parse_args(["audit-exports", "--show-findings", "--dry-run"])
+
+    assert args.show_findings is True
+
+
+def test_main_reports_completed_status_for_audit_exports(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        cli,
+        "load_config",
+        lambda: AppConfig(
+            environment="test",
+            database_url="postgresql://localhost:5432/photo_db_test",
+            photos_root=tmp_path / "photos",
+            log_level="INFO",
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_export_audit",
+        lambda *args, **kwargs: ExportAuditSummary(
+            target="all_staging_exports",
+            audited_count=2,
+            category_counts={"ok": 1, "rotation": 1},
+            findings=[
+                ExportAuditFinding(
+                    photo_id=1,
+                    batch_name="batch-a",
+                    sheet_scan_id=10,
+                    crop_index=0,
+                    category="rotation",
+                    reason="needs R180",
+                    export_path=tmp_path / "photos" / "exports" / "staging" / "photo_1.jpg",
+                    auto_rotation_suggestion=180,
+                    auto_rotation_confidence=0.95,
+                    review_priority="high",
+                    suggested_issue="R180",
+                    suggested_issue_confidence=0.95,
+                    suggested_issue_reason="upside down",
+                )
+            ],
+            csv_path=tmp_path / "photos" / "exports" / "staging" / "export_audit.csv",
+            dry_run=False,
+        ),
+    )
+
+    exit_code = cli.main(["audit-exports"])
+    captured = capsys.readouterr()
+
+    assert exit_code == 0
+    assert "command=audit-exports" in captured.out
+    assert "finding_count=1" in captured.out
+    assert "audit_findings=omitted" in captured.out
+    assert "status=completed" in captured.out
+
+
+def test_handle_audit_exports_prints_findings_only_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path,
+) -> None:
+    summary = ExportAuditSummary(
+        target="all_staging_exports",
+        audited_count=1,
+        category_counts={"rotation": 1},
+        findings=[
+            ExportAuditFinding(
+                photo_id=1,
+                batch_name="batch-a",
+                sheet_scan_id=10,
+                crop_index=0,
+                category="rotation",
+                reason="needs R180",
+                export_path=tmp_path / "photos" / "exports" / "staging" / "photo_1.jpg",
+                auto_rotation_suggestion=180,
+                auto_rotation_confidence=0.95,
+                review_priority="high",
+                suggested_issue="R180",
+                suggested_issue_confidence=0.95,
+                suggested_issue_reason="upside down",
+            )
+        ],
+        csv_path=tmp_path / "photos" / "exports" / "staging" / "export_audit.csv",
+        dry_run=False,
+    )
+    monkeypatch.setattr(cli, "run_export_audit", lambda *args, **kwargs: summary)
+    config = AppConfig(
+        environment="test",
+        database_url="postgresql://localhost:5432/photo_db_test",
+        photos_root=tmp_path / "photos",
+        log_level="INFO",
+    )
+
+    cli._handle_audit_exports(
+        config,
+        batch_name=None,
+        sheet_id=None,
+        photo_id=None,
+        limit=None,
+        category=None,
+        csv_path=None,
+        debug_audit=False,
+        show_findings=False,
+        dry_run=False,
+    )
+    captured = capsys.readouterr()
+    assert "audit_findings=omitted" in captured.out
+    assert "category\tphoto_id" not in captured.out
+
+    cli._handle_audit_exports(
+        config,
+        batch_name=None,
+        sheet_id=None,
+        photo_id=None,
+        limit=None,
+        category=None,
+        csv_path=None,
+        debug_audit=False,
+        show_findings=True,
+        dry_run=False,
+    )
+    captured = capsys.readouterr()
+    assert "category\tphoto_id\tsheet_id\tcrop_index\treason\texport_path" in captured.out
