@@ -29,6 +29,7 @@ from photo_repository import (
     list_open_orientation_review_photo_ids,
     list_photo_artifact_paths,
     list_photo_ids,
+    update_photo_export_disposition,
 )
 import logging
 
@@ -41,7 +42,6 @@ AUTO_PREFILL_ISSUE_THRESHOLDS: dict[str, float] = {
     "R180": 0.90,
 }
 DEFAULT_AUDIT_ORIENTATION_WORKERS = 6
-RESOLVED_EXPORT_AUDIT_FIX_ACTIONS = ("fix_crop", "fix_rotation", "fix_skew")
 ISSUE_CODEBOOK: tuple[tuple[str, str], ...] = (
     ("RR90", "Rotate right 90 degrees."),
     ("RL90", "Rotate left 90 degrees."),
@@ -315,6 +315,12 @@ def _reconcile_staging_export_artifacts(
             removal_key = (allowed_photo_id, existing_path)
             if removal_key in removed_paths:
                 continue
+            update_photo_export_disposition(
+                conn,
+                photo_id=allowed_photo_id,
+                disposition="exclude_reject",
+                note="Manually deleted from staging before audit reconciliation",
+            )
             delete_photo_artifact(
                 conn,
                 photo_id=allowed_photo_id,
@@ -525,8 +531,7 @@ def _write_audit_csv(
     config: AppConfig | None = None,
 ) -> None:
     csv_path.parent.mkdir(parents=True, exist_ok=True)
-    preserved_manual_fields = _load_existing_manual_fields(csv_path)
-    fixed_photo_ids = _photo_ids_with_resolved_export_audit_fixes(config)
+    open_review_fields = _open_export_audit_manual_fields(config)
     sorted_findings = sorted(findings, key=lambda finding: finding.export_path.name)
     fieldnames = [
         "row_type",
@@ -553,19 +558,16 @@ def _write_audit_csv(
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for finding in sorted_findings:
-            photo_id = str(finding.photo_id)
-            preserved = preserved_manual_fields.get(photo_id, {})
-            if photo_id in fixed_photo_ids:
-                preserved = {}
             defaults = _default_manual_fields_for_finding(finding)
+            manual_fields = open_review_fields.get(str(finding.photo_id), defaults)
             writer.writerow(
                 {
                     "row_type": "photo",
                     "export_folder": finding.export_path.parent.name,
                     "export_filename": finding.export_path.name,
-                    "needs_help": preserved.get("needs_help", defaults["needs_help"]),
-                    "issue": preserved.get("issue", defaults["issue"]),
-                    "notes": preserved.get("notes", defaults["notes"]),
+                    "needs_help": manual_fields["needs_help"],
+                    "issue": manual_fields["issue"],
+                    "notes": manual_fields["notes"],
                     "review_priority": finding.review_priority,
                     "suggested_issue": finding.suggested_issue or "",
                     "suggested_issue_confidence": (
@@ -595,50 +597,34 @@ def _write_audit_csv(
             )
 
 
-def _load_existing_manual_fields(csv_path: Path) -> dict[str, dict[str, str]]:
-    if not csv_path.exists():
-        return {}
-
-    manual_fields: dict[str, dict[str, str]] = {}
-    with csv_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            row_type = (row.get("row_type") or "photo").strip().lower()
-            if row_type != "photo":
-                continue
-            photo_id = (row.get("photo_id") or "").strip()
-            if not photo_id:
-                continue
-            manual_fields[photo_id] = {
-                "needs_help": row.get("needs_help", ""),
-                "issue": row.get("issue", row.get("operator_issue", "")),
-                "notes": row.get("notes", row.get("operator_notes", "")),
-            }
-    return manual_fields
-
-
-def _photo_ids_with_resolved_export_audit_fixes(
+def _open_export_audit_manual_fields(
     config: AppConfig | None,
-) -> set[str]:
+) -> dict[str, dict[str, str]]:
     if config is None:
-        return set()
+        return {}
 
     with connect(config) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT DISTINCT entity_id
+                SELECT entity_id, payload_json
                 FROM review_tasks
                 WHERE task_type = 'review_export_audit'
                   AND entity_type = 'photo'
-                  AND status = 'resolved'
-                  AND resolution_json ->> 'action' = ANY(%s)
-                  AND resolved_at IS NOT NULL
-                """,
-                (list(RESOLVED_EXPORT_AUDIT_FIX_ACTIONS),),
+                  AND status IN ('open', 'in_progress')
+                """
             )
             rows = cur.fetchall()
-    return {str(row[0]) for row in rows}
+
+    manual_fields: dict[str, dict[str, str]] = {}
+    for entity_id, payload in rows:
+        payload_json = dict(payload)
+        manual_fields[str(entity_id)] = {
+            "needs_help": "yes",
+            "issue": str(payload_json.get("issue", "")),
+            "notes": str(payload_json.get("notes", "")),
+        }
+    return manual_fields
 
 
 def _default_manual_fields_for_finding(finding: ExportAuditFinding) -> dict[str, str]:

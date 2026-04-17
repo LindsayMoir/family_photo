@@ -7,10 +7,12 @@ from pathlib import Path
 import re
 
 import cv2
+import numpy as np
 
 from config import AppConfig
 from db.connection import connect
 from deskew.service import run_deskew
+from disposition.service import set_photo_export_disposition
 from enhance.service import run_enhancement
 from frame_export.service import (
     FRAME_EXPORT_PIPELINE_VERSION,
@@ -19,6 +21,7 @@ from frame_export.service import (
     STAGING_PORTRAIT_PROFILE,
     resolve_frame_export_request,
     run_frame_export,
+    stage_photo_exports,
 )
 from orientation.service import run_orientation
 from photo_repository import (
@@ -70,6 +73,17 @@ class StagedPhotoContext:
     staging_path: Path
 
 
+@dataclass(frozen=True, slots=True)
+class ManualSplitSummary:
+    """Summary of applying a manual split and restaging the resulting children."""
+
+    photo_id: int
+    input_paths: tuple[Path, ...]
+    staged_photo_ids: tuple[int, ...]
+    resolved_task_id: int | None
+    dry_run: bool
+
+
 def apply_export_audit_fixes(
     config: AppConfig,
     *,
@@ -116,6 +130,82 @@ def apply_export_audit_fixes(
         fixed_count=fixed_count,
         unresolved_count=unresolved_count,
         created_photo_count=created_photo_count,
+        dry_run=False,
+    )
+
+
+def manual_split_photo(
+    config: AppConfig,
+    *,
+    photo_id: int,
+    input_paths: list[Path],
+    note: str | None,
+    dry_run: bool,
+) -> ManualSplitSummary:
+    """Replace one photo with operator-provided split images and restage the results."""
+    resolved_input_paths = _resolve_manual_split_inputs(input_paths)
+    if dry_run:
+        return ManualSplitSummary(
+            photo_id=photo_id,
+            input_paths=tuple(resolved_input_paths),
+            staged_photo_ids=(photo_id,),
+            resolved_task_id=None,
+            dry_run=True,
+        )
+
+    context = _get_photo_repair_context(config, photo_id=photo_id)
+    crops = [_load_manual_split_image(path) for path in resolved_input_paths]
+    expected_staging_profiles = [_staging_profile_for_image(crop) for crop in crops]
+    new_photo_ids = _rewrite_split_photo_arrays(
+        config,
+        context=context,
+        crops=crops,
+        pipeline_version="manual_split_v1",
+        reuse_original_photo=False,
+    )
+    if not new_photo_ids:
+        raise ValueError(f"Manual split did not create any child photos for photo_id={photo_id}.")
+
+    set_photo_export_disposition(
+        config,
+        photo_id=context.photo_id,
+        disposition="exclude_reject",
+        note="replaced by manual split children",
+        dry_run=False,
+    )
+    _reprocess_split_photo_ids(config, photo_ids=new_photo_ids)
+    _enforce_staging_profiles(
+        config,
+        photo_ids=new_photo_ids,
+        expected_profiles=expected_staging_profiles,
+    )
+
+    resolved_task_id = _find_open_export_audit_task_id(config, photo_id=photo_id)
+    if resolved_task_id is not None:
+        resolve_export_audit_review(
+            config,
+            task_id=resolved_task_id,
+            export_action="fix_crop",
+            note=note or "manual split applied",
+            dry_run=False,
+        )
+    resolve_orientation_review_for_photo(
+        config,
+        photo_id=context.photo_id,
+        action="excluded_via_manual_split",
+    )
+    for current_photo_id in new_photo_ids:
+        resolve_orientation_review_for_photo(
+            config,
+            photo_id=current_photo_id,
+            action="fixed_via_manual_split",
+        )
+
+    return ManualSplitSummary(
+        photo_id=photo_id,
+        input_paths=tuple(resolved_input_paths),
+        staged_photo_ids=tuple(new_photo_ids),
+        resolved_task_id=resolved_task_id,
         dry_run=False,
     )
 
@@ -233,39 +323,78 @@ def _apply_split_fix(
     if len(regions) < 2:
         raise ValueError(f"Unable to split merged raw crop for photo_id={context.photo_id}.")
 
-    new_photo_ids = _rewrite_split_photos(
+    crops = [image[y1:y2, x1:x2] for (x1, y1, x2, y2) in regions]
+    new_photo_ids = _rewrite_split_photo_arrays(
         config,
         context=context,
-        image=image,
-        regions=regions,
+        crops=crops,
+        pipeline_version="auto_split_v1",
     )
     all_photo_ids = [context.photo_id, *new_photo_ids]
-
-    for photo_id in all_photo_ids:
-        run_deskew(config, photo_id=photo_id, dry_run=False)
-        orientation_probe = run_orientation(config, photo_id=photo_id, dry_run=True)
-        if orientation_probe.review_required:
-            run_orientation(
-                config,
-                photo_id=photo_id,
-                forced_rotation=orientation_probe.rotation_degrees,
-                dry_run=False,
-            )
-        else:
-            run_orientation(config, photo_id=photo_id, dry_run=False)
-        run_enhancement(config, photo_id=photo_id, dry_run=False)
-        run_frame_export(
-            config,
-            batch_name=None,
-            sheet_id=None,
-            photo_id=photo_id,
-            limit=None,
-            width_px=export_width,
-            height_px=export_height,
-            profile_name=export_profile,
-            dry_run=False,
-        )
+    _reprocess_split_photo_ids(
+        config,
+        photo_ids=all_photo_ids,
+        export_width=export_width,
+        export_height=export_height,
+        export_profile=export_profile,
+    )
     return all_photo_ids
+
+
+def _ensure_photo_has_staging_export(
+    config: AppConfig,
+    *,
+    photo_id: int,
+) -> Path:
+    artifact_path = _get_existing_staging_export_path(config, photo_id=photo_id)
+    if artifact_path is not None and artifact_path.exists():
+        return artifact_path
+
+    stage_photo_exports(
+        config,
+        photo_ids=[photo_id],
+        dry_run=False,
+    )
+    artifact_path = _get_existing_staging_export_path(config, photo_id=photo_id)
+    if artifact_path is None or not artifact_path.exists():
+        raise ValueError(f"Split photo {photo_id} did not produce a staging export.")
+    return artifact_path
+
+
+def _get_existing_staging_export_path(
+    config: AppConfig,
+    *,
+    photo_id: int,
+) -> Path | None:
+    with connect(config) as conn:
+        return get_photo_artifact_path(
+            conn,
+            photo_id=photo_id,
+            artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+        )
+
+
+def _resolve_manual_split_inputs(input_paths: list[Path]) -> list[Path]:
+    if len(input_paths) < 2:
+        raise ValueError("Manual split requires at least two --input files.")
+    resolved: list[Path] = []
+    for input_path in input_paths:
+        resolved_path = input_path.expanduser().resolve()
+        if not resolved_path.exists():
+            raise ValueError(f"Manual split input was not found: {resolved_path}")
+        if not resolved_path.is_file():
+            raise ValueError(f"Manual split input is not a file: {resolved_path}")
+        resolved.append(resolved_path)
+    return resolved
+
+
+def _load_manual_split_image(path: Path):
+    image = cv2.imread(str(path))
+    if image is None:
+        raise ValueError(f"Unable to load manual split image: {path}")
+    if image.size == 0:
+        raise ValueError(f"Manual split image is empty: {path}")
+    return image
 
 
 def _get_photo_repair_context(config: AppConfig, *, photo_id: int) -> PhotoRepairContext:
@@ -446,6 +575,94 @@ def _staging_profile_for_image(image) -> str:
     return STAGING_LANDSCAPE_PROFILE
 
 
+def _reprocess_split_photo_ids(
+    config: AppConfig,
+    *,
+    photo_ids: list[int],
+    export_width: int | None = None,
+    export_height: int | None = None,
+    export_profile: str | None = None,
+) -> None:
+    resolved_width = export_width
+    resolved_height = export_height
+    resolved_profile = export_profile
+    if resolved_width is None or resolved_height is None or resolved_profile is None:
+        resolved_width, resolved_height, resolved_profile = resolve_frame_export_request(
+            preset_name="auto",
+            width_px=None,
+            height_px=None,
+            profile_name=None,
+        )
+
+    for photo_id in photo_ids:
+        run_deskew(config, photo_id=photo_id, dry_run=False)
+        orientation_probe = run_orientation(config, photo_id=photo_id, dry_run=True)
+        if orientation_probe.review_required:
+            run_orientation(
+                config,
+                photo_id=photo_id,
+                forced_rotation=orientation_probe.rotation_degrees,
+                dry_run=False,
+            )
+        else:
+            run_orientation(config, photo_id=photo_id, dry_run=False)
+        run_enhancement(config, photo_id=photo_id, dry_run=False)
+        run_frame_export(
+            config,
+            batch_name=None,
+            sheet_id=None,
+            photo_id=photo_id,
+            limit=None,
+            width_px=resolved_width,
+            height_px=resolved_height,
+            profile_name=resolved_profile,
+            dry_run=False,
+        )
+        _ensure_photo_has_staging_export(config, photo_id=photo_id)
+
+
+def _enforce_staging_profiles(
+    config: AppConfig,
+    *,
+    photo_ids: list[int],
+    expected_profiles: list[str],
+) -> None:
+    if len(photo_ids) != len(expected_profiles):
+        raise ValueError("Photo ids and expected profiles must have the same length.")
+
+    with connect(config) as conn:
+        for photo_id, expected_profile in zip(photo_ids, expected_profiles, strict=True):
+            current_path = get_photo_artifact_path(
+                conn,
+                photo_id=photo_id,
+                artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+            )
+            if current_path is None:
+                raise ValueError(f"Photo {photo_id} does not have a staged export to correct.")
+            target_path = config.photos_root / "exports" / expected_profile / current_path.name
+            if current_path == target_path:
+                continue
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            if target_path.exists():
+                target_path.unlink()
+            current_path.replace(target_path)
+            delete_photo_artifact(
+                conn,
+                photo_id=photo_id,
+                artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+                path=current_path,
+            )
+            insert_photo_artifact(
+                conn,
+                photo_id=photo_id,
+                artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+                path=target_path,
+                pipeline_stage="frame_export",
+                pipeline_version=FRAME_EXPORT_PIPELINE_VERSION,
+            )
+        conn.commit()
+
+
 def _task_issue_codes(task: ReviewTask) -> list[str]:
     payload_codes = task.payload_json.get("issue_codes")
     if isinstance(payload_codes, list):
@@ -528,7 +745,42 @@ def _detect_split_regions(image) -> list[tuple[int, int, int, int]]:
         regions.append((x, y, x + width, y + height))
 
     regions.sort(key=lambda region: (region[0], region[1]))
-    return _merge_overlapping_regions(regions)
+    merged_regions = _merge_overlapping_regions(regions)
+    if len(merged_regions) >= 2:
+        return merged_regions
+    seam_regions = _detect_regions_from_vertical_seam(gray)
+    if seam_regions:
+        return seam_regions
+    return merged_regions
+
+
+def _detect_regions_from_vertical_seam(gray_image) -> list[tuple[int, int, int, int]]:
+    height, width = gray_image.shape[:2]
+    minimum_side_width = max(1, int(width * 0.2))
+    if width < 2 * minimum_side_width:
+        return []
+
+    column_means = gray_image.mean(axis=0)
+    smoothed_means = np.convolve(column_means, np.ones(15, dtype=float) / 15.0, mode="same")
+    edge_strength = np.abs(np.diff(smoothed_means))
+    search_start = minimum_side_width
+    search_end = width - minimum_side_width
+    if search_end - search_start < 2:
+        return []
+
+    local_edges = edge_strength[search_start : search_end - 1]
+    if local_edges.size == 0:
+        return []
+
+    split_x = int(np.argmax(local_edges) + search_start + 1)
+    if split_x <= minimum_side_width or width - split_x <= minimum_side_width:
+        return []
+    if float(edge_strength[split_x - 1]) < 2.0:
+        return []
+    return [
+        (0, 0, split_x, height),
+        (split_x, 0, width, height),
+    ]
 
 
 def _merge_overlapping_regions(
@@ -557,6 +809,23 @@ def _rewrite_split_photos(
     image,
     regions: list[tuple[int, int, int, int]],
 ) -> list[int]:
+    crops = [image[y1:y2, x1:x2] for (x1, y1, x2, y2) in regions]
+    return _rewrite_split_photo_arrays(
+        config,
+        context=context,
+        crops=crops,
+        pipeline_version="auto_split_v1",
+    )
+
+
+def _rewrite_split_photo_arrays(
+    config: AppConfig,
+    *,
+    context: PhotoRepairContext,
+    crops: list,
+    pipeline_version: str,
+    reuse_original_photo: bool = True,
+) -> list[int]:
     new_photo_ids: list[int] = []
     with connect(config) as conn:
         with conn.cursor() as cur:
@@ -570,11 +839,10 @@ def _rewrite_split_photos(
             )
             max_crop_index = int(cur.fetchone()[0])
 
-            for region_index, (x1, y1, x2, y2) in enumerate(regions, start=1):
-                crop = image[y1:y2, x1:x2]
+            for region_index, crop in enumerate(crops, start=1):
                 if crop.size == 0:
                     continue
-                if region_index == 1:
+                if reuse_original_photo and region_index == 1:
                     target_photo_id = context.photo_id
                     crop_index = context.crop_index
                 else:
@@ -646,7 +914,29 @@ def _rewrite_split_photos(
                     artifact_type="raw_crop",
                     path=relative_crop_path,
                     pipeline_stage="crop",
-                    pipeline_version="auto_split_v1",
+                    pipeline_version=pipeline_version,
                 )
         conn.commit()
     return new_photo_ids
+
+
+def _find_open_export_audit_task_id(config: AppConfig, *, photo_id: int) -> int | None:
+    with connect(config) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id
+                FROM review_tasks
+                WHERE entity_type = 'photo'
+                  AND entity_id = %s
+                  AND task_type = 'review_export_audit'
+                  AND status = 'open'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (photo_id,),
+            )
+            row = cur.fetchone()
+    if row is None:
+        return None
+    return int(row[0])

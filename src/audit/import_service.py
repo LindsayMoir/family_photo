@@ -91,7 +91,87 @@ def import_audit_csv(
             dry_run=True,
         )
 
+    sync_result = _sync_export_audit_review_tasks(config, rows)
+    flagged_rows = sync_result.flagged_rows
+    created_or_updated_count = sync_result.created_or_updated_count
+    dismissed_count = sync_result.dismissed_count
+    delete_photo_ids = sync_result.delete_photo_ids
+
+    for photo_id in delete_photo_ids:
+        set_photo_export_disposition(
+            config,
+            photo_id=photo_id,
+            disposition="exclude_reject",
+            note="Deleted from staging via export audit CSV",
+            dry_run=False,
+        )
+    deleted_count = len(delete_photo_ids)
+
+    promote_summary = promote_staging_exports(
+        config,
+        csv_path=csv_path,
+        dry_run=False,
+    )
+    promoted_count = promote_summary.promoted_count
+    delete_staging_exports(
+        config,
+        csv_path=csv_path,
+        dry_run=False,
+    )
+    fix_summary = apply_export_audit_fixes(config, dry_run=False)
+    auto_fixed_count = fix_summary.fixed_count
+    auto_fix_unresolved_count = fix_summary.unresolved_count
+    created_photo_count = fix_summary.created_photo_count
+    if csv_path.exists():
+        csv_path.unlink()
+    run_export_audit(
+        config,
+        batch_name=None,
+        sheet_id=None,
+        photo_id=None,
+        limit=None,
+        category=None,
+        csv_path=csv_path,
+        dry_run=False,
+    )
+    refreshed_rows = _read_audit_rows(csv_path)
+    refreshed_sync_result = _sync_export_audit_review_tasks(config, refreshed_rows)
+    dismissed_count += refreshed_sync_result.dismissed_count
+
+    return AuditImportSummary(
+        csv_path=csv_path,
+        processed_rows=processed_rows,
+        flagged_rows=flagged_rows,
+        created_or_updated_count=created_or_updated_count,
+        dismissed_count=dismissed_count,
+        deleted_count=deleted_count,
+        promoted_count=promoted_count,
+        auto_fixed_count=auto_fixed_count,
+        auto_fix_unresolved_count=auto_fix_unresolved_count,
+        created_photo_count=created_photo_count,
+        dry_run=False,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewTaskSyncResult:
+    """Summary of syncing export-audit review tasks from one CSV snapshot."""
+
+    flagged_rows: int
+    created_or_updated_count: int
+    dismissed_count: int
+    delete_photo_ids: list[int]
+
+
+def _sync_export_audit_review_tasks(
+    config: AppConfig,
+    rows: list[dict[str, str]],
+) -> ReviewTaskSyncResult:
+    flagged_rows = 0
+    created_or_updated_count = 0
+    dismissed_count = 0
     delete_photo_ids: list[int] = []
+
     with connect(config) as conn:
         for row in rows:
             photo_id = int(row["photo_id"])
@@ -134,56 +214,11 @@ def import_audit_csv(
             )
         conn.commit()
 
-    for photo_id in delete_photo_ids:
-        set_photo_export_disposition(
-            config,
-            photo_id=photo_id,
-            disposition="exclude_reject",
-            note="Deleted from staging via export audit CSV",
-            dry_run=False,
-        )
-    deleted_count = len(delete_photo_ids)
-
-    promote_summary = promote_staging_exports(
-        config,
-        csv_path=csv_path,
-        dry_run=False,
-    )
-    promoted_count = promote_summary.promoted_count
-    delete_staging_exports(
-        config,
-        csv_path=csv_path,
-        dry_run=False,
-    )
-    fix_summary = apply_export_audit_fixes(config, dry_run=False)
-    auto_fixed_count = fix_summary.fixed_count
-    auto_fix_unresolved_count = fix_summary.unresolved_count
-    created_photo_count = fix_summary.created_photo_count
-    if csv_path.exists():
-        csv_path.unlink()
-    run_export_audit(
-        config,
-        batch_name=None,
-        sheet_id=None,
-        photo_id=None,
-        limit=None,
-        category=None,
-        csv_path=csv_path,
-        dry_run=False,
-    )
-
-    return AuditImportSummary(
-        csv_path=csv_path,
-        processed_rows=processed_rows,
+    return ReviewTaskSyncResult(
         flagged_rows=flagged_rows,
         created_or_updated_count=created_or_updated_count,
         dismissed_count=dismissed_count,
-        deleted_count=deleted_count,
-        promoted_count=promoted_count,
-        auto_fixed_count=auto_fixed_count,
-        auto_fix_unresolved_count=auto_fix_unresolved_count,
-        created_photo_count=created_photo_count,
-        dry_run=False,
+        delete_photo_ids=delete_photo_ids,
     )
 
 

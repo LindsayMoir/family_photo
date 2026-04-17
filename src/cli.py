@@ -18,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
 from app_logging import configure_logging
 from audit.eval_service import run_audit_model_trial
 from audit.import_service import import_audit_csv
+from audit.fix_service import manual_split_photo
 from audit.service import run_export_audit
 from config import AppConfig, ConfigError, load_config
 from crop.service import run_crop
@@ -32,10 +33,17 @@ from frame_export.service import (
     resolve_frame_export_request,
     run_frame_export,
 )
+from frame_export.error_service import (
+    apply_manual_staging_edits,
+    requeue_final_exports_for_audit,
+    restage_export_errors,
+    stage_next_exports_for_audit,
+)
 from ingest.service import run_ingest
 from orientation.service import run_orientation
 from pipeline.service import run_batch, run_process, run_until_review
 from pipeline.types import CommandPlan
+from reset.service import reset_source_scans
 from review.service import (
     apply_orientation_review,
     dismiss_ocr_reviews,
@@ -64,7 +72,13 @@ STATUS_TRACKED_COMMANDS = {
     "audit-exports",
     "audit-model-trial",
     "import-audit-csv",
+    "requeue-final-exports",
+    "restage-export-errors",
+    "stage-next-exports",
     "promote-exports",
+    "reset-source-scans",
+    "manual-split-photo",
+    "apply-manual-staging-edits",
 }
 
 
@@ -347,6 +361,95 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="CSV path to import. Defaults to photos/exports/staging/export_audit.csv.",
     )
+    restage_export_errors_parser = subparsers.add_parser(
+        "restage-export-errors",
+        help="Restage final-export errors listed in photos/exports/errors.txt and rebuild a focused audit CSV.",
+    )
+    _add_dry_run_argument(restage_export_errors_parser)
+    restage_export_errors_parser.add_argument(
+        "--errors-path",
+        type=Path,
+        help="Path to the error list. Defaults to photos/exports/errors.txt.",
+    )
+    restage_export_errors_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="Optional CSV output path. Defaults to photos/exports/staging/export_audit.csv.",
+    )
+    requeue_final_exports_parser = subparsers.add_parser(
+        "requeue-final-exports",
+        help="Move all exports from a final frame folder back into staging and rebuild an audit CSV.",
+    )
+    _add_dry_run_argument(requeue_final_exports_parser)
+    requeue_final_exports_parser.add_argument(
+        "--source-profile",
+        choices=["frame_1080x1920", "frame_1920x1080"],
+        default="frame_1080x1920",
+        help="Final export folder to requeue. Defaults to frame_1080x1920.",
+    )
+    requeue_final_exports_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="Optional CSV output path. Defaults to photos/exports/staging/export_audit.csv.",
+    )
+    stage_next_exports_parser = subparsers.add_parser(
+        "stage-next-exports",
+        help="Stage the next export-ready batch into staging and rebuild a focused audit CSV.",
+    )
+    _add_dry_run_argument(stage_next_exports_parser)
+    stage_next_target = stage_next_exports_parser.add_mutually_exclusive_group()
+    stage_next_target.add_argument("--batch", help="Optional batch name to limit the selection.")
+    stage_next_target.add_argument("--sheet-id", type=int, help="Optional sheet id to limit the selection.")
+    stage_next_exports_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of export-ready photos to stage. Defaults to 20.",
+    )
+    stage_next_exports_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="Optional CSV output path. Defaults to photos/exports/staging/export_audit.csv.",
+    )
+    reset_source_scans_parser = subparsers.add_parser(
+        "reset-source-scans",
+        help="Delete downstream rows and artifacts for rescanned source directories.",
+    )
+    _add_dry_run_argument(reset_source_scans_parser)
+    reset_source_scans_parser.add_argument(
+        "--source-dir",
+        action="append",
+        required=True,
+        type=Path,
+        help="Source directory under photos_root (or an absolute path) to reset. Repeat as needed.",
+    )
+    manual_split_parser = subparsers.add_parser(
+        "manual-split-photo",
+        help="Replace one merged photo with operator-provided split images and restage the results.",
+    )
+    _add_dry_run_argument(manual_split_parser)
+    manual_split_parser.add_argument("--photo-id", required=True, type=int, help="Merged photo id to replace.")
+    manual_split_parser.add_argument(
+        "--input",
+        action="append",
+        required=True,
+        type=Path,
+        help="Path to one split image. Repeat at least twice, in left-to-right or top-to-bottom order.",
+    )
+    manual_split_parser.add_argument("--note", help="Optional note stored on the resolved review task.")
+    apply_manual_edits_parser = subparsers.add_parser(
+        "apply-manual-staging-edits",
+        help="Apply edited files from photos/exports/staging/temp back into staged exports.",
+    )
+    _add_dry_run_argument(apply_manual_edits_parser)
+    apply_manual_edits_parser.add_argument(
+        "--temp-dir",
+        type=Path,
+        help=(
+            "Directory of edited photo_<id>.jpg replacements and photo_<id>_<n>.jpg "
+            "manual split files. Defaults to photos/exports/staging/temp."
+        ),
+    )
     audit_model_trial_parser = subparsers.add_parser(
         "audit-model-trial",
         help="Run a non-destructive comparison between manual audit labels and model suggestions.",
@@ -377,7 +480,7 @@ def build_parser() -> argparse.ArgumentParser:
     promote_exports_parser.add_argument(
         "--csv-path",
         type=Path,
-        help="CSV path to use for promotion. Defaults to photos/exports/staging/export_audit.csv.",
+        help="Optional CSV path to gate promotion. When omitted, all current staged exports are promoted.",
     )
 
     review_parser = subparsers.add_parser("review", help="Inspect or resolve review tasks.")
@@ -651,6 +754,55 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
             dry_run=args.dry_run,
         )
         return 0
+    if args.command == "restage-export-errors":
+        _handle_restage_export_errors(
+            config,
+            errors_path=args.errors_path,
+            csv_path=args.csv_path,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "requeue-final-exports":
+        _handle_requeue_final_exports(
+            config,
+            source_profile=args.source_profile,
+            csv_path=args.csv_path,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "stage-next-exports":
+        _handle_stage_next_exports(
+            config,
+            batch_name=args.batch,
+            sheet_id=args.sheet_id,
+            limit=args.limit,
+            csv_path=args.csv_path,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "reset-source-scans":
+        _handle_reset_source_scans(
+            config,
+            source_dirs=args.source_dir,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "manual-split-photo":
+        _handle_manual_split_photo(
+            config,
+            photo_id=args.photo_id,
+            input_paths=args.input,
+            note=args.note,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "apply-manual-staging-edits":
+        _handle_apply_manual_staging_edits(
+            config,
+            temp_dir=args.temp_dir,
+            dry_run=args.dry_run,
+        )
+        return 0
     if args.command == "audit-model-trial":
         _handle_audit_model_trial(
             config,
@@ -832,7 +984,10 @@ def _handle_run_batch(
     print(f"exported_count={result.exported_count}")
     if result.exported_count > 0:
         print(f"staging_csv_path={config.photos_root / 'exports' / 'staging' / 'export_audit.csv'}")
-        print("next_staging_review_command=PYTHONPATH=src python3 -m cli audit-exports")
+        print(
+            "next_staging_review_command="
+            "PYTHONPATH=src python3 -m cli stage-next-exports --batch <batch_name> --limit 20"
+        )
     _print_run_batch_review_summary(result.review_task_counts)
     if result.blocking_task is None:
         print("next_review_task=none")
@@ -1134,6 +1289,215 @@ def _handle_import_audit_csv(
     print(f"created_photo_count={result.created_photo_count}")
 
 
+def _handle_restage_export_errors(
+    config: AppConfig,
+    *,
+    errors_path: Path | None,
+    csv_path: Path | None,
+    dry_run: bool,
+) -> None:
+    resolved_errors_path = (
+        errors_path
+        if errors_path is not None
+        else config.photos_root / "exports" / "errors.txt"
+    )
+    resolved_csv_path = (
+        csv_path
+        if csv_path is not None
+        else config.photos_root / "exports" / "staging" / "export_audit.csv"
+    )
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="restage-export-errors",
+                target=str(resolved_errors_path),
+                dry_run=True,
+                notes=(
+                    "parse photo names from the error list",
+                    "restage matching final exports back into staging",
+                    f"write focused audit CSV to {resolved_csv_path}",
+                ),
+            )
+        )
+        return
+
+    result = restage_export_errors(
+        config,
+        errors_path=resolved_errors_path,
+        csv_path=resolved_csv_path,
+        dry_run=False,
+    )
+    print("command=restage-export-errors")
+    print(f"errors_path={result.errors_path}")
+    print(f"csv_path={result.csv_path}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"requested_count={result.requested_count}")
+    print(f"staged_count={result.staged_count}")
+    print(f"audited_count={result.audited_count}")
+    print(f"missing_count={len(result.missing_entries)}")
+    if result.missing_entries:
+        print("missing_entries=" + ",".join(result.missing_entries))
+
+
+def _handle_requeue_final_exports(
+    config: AppConfig,
+    *,
+    source_profile: str,
+    csv_path: Path | None,
+    dry_run: bool,
+) -> None:
+    resolved_csv_path = (
+        csv_path
+        if csv_path is not None
+        else config.photos_root / "exports" / "staging" / "export_audit.csv"
+    )
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="requeue-final-exports",
+                target=source_profile,
+                dry_run=True,
+                notes=(
+                    "move final exports back into staging",
+                    "update frame export artifacts from final to staging",
+                    f"write focused audit CSV to {resolved_csv_path}",
+                ),
+            )
+        )
+        return
+
+    result = requeue_final_exports_for_audit(
+        config,
+        source_profile=source_profile,
+        csv_path=resolved_csv_path,
+        dry_run=False,
+    )
+    print("command=requeue-final-exports")
+    print(f"source_dir={result.source_dir}")
+    print(f"csv_path={result.csv_path}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"queued_count={result.queued_count}")
+    print(f"audited_count={result.audited_count}")
+
+
+def _handle_stage_next_exports(
+    config: AppConfig,
+    *,
+    batch_name: str | None,
+    sheet_id: int | None,
+    limit: int,
+    csv_path: Path | None,
+    dry_run: bool,
+) -> None:
+    resolved_csv_path = (
+        csv_path
+        if csv_path is not None
+        else config.photos_root / "exports" / "staging" / "export_audit.csv"
+    )
+    target = batch_name if batch_name is not None else f"sheet_id={sheet_id}" if sheet_id is not None else "all_export_ready"
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="stage-next-exports",
+                target=target,
+                dry_run=True,
+                notes=(
+                    f"limit={limit}",
+                    "stage the next export-ready photos into staging",
+                    f"write focused audit CSV to {resolved_csv_path}",
+                ),
+            )
+        )
+        return
+
+    result = stage_next_exports_for_audit(
+        config,
+        batch_name=batch_name,
+        sheet_id=sheet_id,
+        limit=limit,
+        csv_path=resolved_csv_path,
+        dry_run=False,
+    )
+    print("command=stage-next-exports")
+    print(f"target={result.target}")
+    print(f"csv_path={result.csv_path}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"selected_count={result.selected_count}")
+    print(f"staged_count={result.staged_count}")
+    print(f"audited_count={result.audited_count}")
+
+
+def _handle_reset_source_scans(
+    config: AppConfig,
+    *,
+    source_dirs: list[Path],
+    dry_run: bool,
+) -> None:
+    result = reset_source_scans(
+        config,
+        source_dirs=source_dirs,
+        dry_run=dry_run,
+    )
+    print("command=reset-source-scans")
+    print("source_dirs=" + ",".join(str(path) for path in result.source_dirs))
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"sheet_count={result.sheet_count}")
+    print(f"detection_count={result.detection_count}")
+    print(f"photo_count={result.photo_count}")
+    print(f"artifact_count={result.artifact_count}")
+    print(f"face_count={result.face_count}")
+    print(f"photo_people_count={result.photo_people_count}")
+    print(f"review_task_count={result.review_task_count}")
+    print(f"ocr_request_count={result.ocr_request_count}")
+    print(f"processing_job_count={result.processing_job_count}")
+    print(f"file_count={result.file_count}")
+    print(f"deleted_file_count={result.deleted_file_count}")
+
+
+def _handle_manual_split_photo(
+    config: AppConfig,
+    *,
+    photo_id: int,
+    input_paths: list[Path],
+    note: str | None,
+    dry_run: bool,
+) -> None:
+    result = manual_split_photo(
+        config,
+        photo_id=photo_id,
+        input_paths=input_paths,
+        note=note,
+        dry_run=dry_run,
+    )
+    print("command=manual-split-photo")
+    print(f"photo_id={result.photo_id}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print("input_paths=" + ",".join(str(path) for path in result.input_paths))
+    print("staged_photo_ids=" + ",".join(str(value) for value in result.staged_photo_ids))
+    print(f"resolved_task_id={result.resolved_task_id or ''}")
+
+
+def _handle_apply_manual_staging_edits(
+    config: AppConfig,
+    *,
+    temp_dir: Path | None,
+    dry_run: bool,
+) -> None:
+    result = apply_manual_staging_edits(
+        config,
+        temp_dir=temp_dir,
+        dry_run=dry_run,
+    )
+    print("command=apply-manual-staging-edits")
+    print(f"temp_dir={result.temp_dir}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"edited_count={result.edited_count}")
+    print(f"staged_count={result.staged_count}")
+    print(f"missing_count={len(result.missing_entries)}")
+    if result.missing_entries:
+        print("missing_entries=" + ",".join(result.missing_entries))
+
+
 def _handle_audit_model_trial(
     config: AppConfig,
     *,
@@ -1182,29 +1546,30 @@ def _handle_promote_exports(
     csv_path: Path | None,
     dry_run: bool,
 ) -> None:
-    resolved_csv_path = (
-        csv_path
-        if csv_path is not None
-        else config.photos_root / "exports" / "staging" / "export_audit.csv"
-    )
     if dry_run:
+        target = str(csv_path) if csv_path is not None else "all_staging_exports"
+        notes = (
+            ("promote staging rows with blank needs_help into final frame folders",)
+            if csv_path is not None
+            else ("promote all current staged exports into final frame folders",)
+        )
         _print_plan(
             CommandPlan(
                 command_name="promote-exports",
-                target=str(resolved_csv_path),
+                target=target,
                 dry_run=True,
-                notes=("promote staging rows with blank needs_help into final frame folders",),
+                notes=notes,
             )
         )
         return
 
     result = promote_staging_exports(
         config,
-        csv_path=resolved_csv_path,
+        csv_path=csv_path,
         dry_run=False,
     )
     print("command=promote-exports")
-    print(f"csv_path={result.csv_path}")
+    print(f"csv_path={result.csv_path or ''}")
     print(f"dry_run={str(result.dry_run).lower()}")
     print(f"promoted_count={result.promoted_count}")
     print(f"skipped_count={result.skipped_count}")
@@ -1464,6 +1829,8 @@ def _print_run_batch_next_actions(task_type: str) -> None:
 def _command_target(args: argparse.Namespace) -> str | None:
     if getattr(args, "batch", None) is not None:
         return str(args.batch)
+    if getattr(args, "source_dir", None):
+        return ",".join(str(path) for path in args.source_dir)
     if getattr(args, "sheet_id", None) is not None:
         return f"sheet_id={args.sheet_id}"
     if getattr(args, "photo_id", None) is not None:

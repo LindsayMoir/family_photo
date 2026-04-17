@@ -17,6 +17,9 @@ DESKEW_STATUS = "deskew_complete"
 DESKEW_ARTIFACT_TYPE = "deskewed"
 DESKEW_PIPELINE_VERSION = "deskew_v1"
 MAX_DESKEW_ABS_ANGLE = 8.0
+DESKEW_ANGLE_BIN_SIZE = 0.5
+DESKEW_CLUSTER_WINDOW = 0.75
+NONZERO_BIN_SELECTION_RATIO = 0.7
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,21 +98,73 @@ def _estimate_deskew(image_path: Path) -> tuple[float, float]:
         return 0.0, 0.0
 
     angles: list[float] = []
+    weights: list[float] = []
     for line in lines[:, 0]:
         x1, y1, x2, y2 = line.tolist()
         angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
-        normalized = ((angle + 90.0) % 180.0) - 90.0
+        normalized = _normalize_line_angle(angle)
         if abs(normalized) <= MAX_DESKEW_ABS_ANGLE:
             angles.append(float(normalized))
+            weights.append(float(np.hypot(x2 - x1, y2 - y1)))
 
     if not angles:
         return 0.0, 0.0
 
-    median_angle = float(np.median(np.array(angles)))
-    confidence = min(len(angles) / 20.0, 1.0)
-    if abs(median_angle) < 0.15:
+    estimated_angle = _select_dominant_deskew_angle(angles, weights)
+    confidence = min(sum(weights) / 4000.0, 1.0)
+    if abs(estimated_angle) < 0.15:
         return 0.0, confidence
-    return round(median_angle, 4), round(confidence, 4)
+    return round(estimated_angle, 4), round(confidence, 4)
+
+
+def _normalize_line_angle(angle_degrees: float) -> float:
+    normalized = ((angle_degrees + 90.0) % 180.0) - 90.0
+    return float(normalized)
+
+
+def _select_dominant_deskew_angle(
+    angles: list[float],
+    weights: list[float],
+) -> float:
+    if not angles or not weights or len(angles) != len(weights):
+        return 0.0
+
+    histogram: dict[float, float] = {}
+    for angle, weight in zip(angles, weights):
+        bucket = round(angle / DESKEW_ANGLE_BIN_SIZE) * DESKEW_ANGLE_BIN_SIZE
+        histogram[bucket] = histogram.get(bucket, 0.0) + weight
+
+    if not histogram:
+        return 0.0
+
+    strongest_bucket, strongest_weight = max(histogram.items(), key=lambda item: item[1])
+    zero_weight = histogram.get(0.0, 0.0)
+    selected_bucket = strongest_bucket
+
+    nonzero_candidates = [
+        (bucket, weight)
+        for bucket, weight in histogram.items()
+        if abs(bucket) >= DESKEW_ANGLE_BIN_SIZE
+    ]
+    if nonzero_candidates:
+        best_nonzero_bucket, best_nonzero_weight = max(nonzero_candidates, key=lambda item: item[1])
+        if strongest_bucket == 0.0 and best_nonzero_weight >= zero_weight * NONZERO_BIN_SELECTION_RATIO:
+            selected_bucket = best_nonzero_bucket
+            strongest_weight = best_nonzero_weight
+
+    clustered_angles = [
+        (angle, weight)
+        for angle, weight in zip(angles, weights)
+        if abs(angle - selected_bucket) <= DESKEW_CLUSTER_WINDOW
+    ]
+    if not clustered_angles:
+        return float(selected_bucket)
+
+    refined_angles = np.array([angle for angle, _ in clustered_angles], dtype=float)
+    refined_weights = np.array([weight for _, weight in clustered_angles], dtype=float)
+    if refined_weights.sum() <= 0:
+        return float(selected_bucket)
+    return float(np.average(refined_angles, weights=refined_weights))
 
 
 def _write_deskewed_image(input_path: Path, output_path: Path, angle: float) -> None:
