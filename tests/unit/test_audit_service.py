@@ -137,6 +137,7 @@ def test_reconcile_staging_export_artifacts_removes_missing_file_artifacts(app_c
 
     inserted: list[str] = []
     deleted: list[str] = []
+    updated: list[tuple[int, str, str]] = []
 
     monkeypatch.setattr("audit.service.list_photo_ids", lambda *args, **kwargs: [789])
     monkeypatch.setattr("audit.service.list_photo_artifact_paths", lambda *args, **kwargs: [missing_path])
@@ -147,6 +148,10 @@ def test_reconcile_staging_export_artifacts_removes_missing_file_artifacts(app_c
     monkeypatch.setattr(
         "audit.service.delete_photo_artifact",
         lambda *args, **kwargs: deleted.append(str(kwargs["path"])),
+    )
+    monkeypatch.setattr(
+        "audit.service.update_photo_export_disposition",
+        lambda conn, photo_id, disposition, note: updated.append((photo_id, disposition, note)),
     )
 
     _reconcile_staging_export_artifacts(
@@ -159,6 +164,9 @@ def test_reconcile_staging_export_artifacts_removes_missing_file_artifacts(app_c
     )
 
     assert inserted == []
+    assert updated == [
+        (789, "exclude_reject", "Manually deleted from staging before audit reconciliation")
+    ]
     assert deleted == [str(missing_path)]
 
 
@@ -186,38 +194,13 @@ def test_default_manual_fields_prefill_only_for_high_confidence_r180() -> None:
     }
 
 
-def test_should_auto_prefill_issue_rejects_merge_suggestions() -> None:
-    finding = ExportAuditFinding(
-        photo_id=10,
-        batch_name="batch-a",
-        sheet_scan_id=20,
-        crop_index=1,
-        category="merged_detection",
-        reason="vision audit suggests MERGE",
-        export_path=Path("/tmp/photo_10.jpg"),
-        auto_rotation_suggestion=0,
-        auto_rotation_confidence=0.0,
-        review_priority="high",
-        suggested_issue="MERGE",
-        suggested_issue_confidence=0.99,
-        suggested_issue_reason="vision audit suggests MERGE",
-    )
-
-    assert _should_auto_prefill_issue(finding) is False
-    assert _default_manual_fields_for_finding(finding) == {
-        "needs_help": "",
-        "issue": "",
-        "notes": "",
-    }
-
-
-def test_write_audit_csv_preserves_manual_issue_over_model_default(tmp_path) -> None:
+def test_write_audit_csv_resets_operator_fields_on_refresh(tmp_path) -> None:
     csv_path = tmp_path / "export_audit.csv"
     csv_path.write_text(
         "\n".join(
             [
                 "row_type,export_folder,export_filename,needs_help,issue,notes,review_priority,auto_rotation_suggestion,auto_rotation_confidence,audit_category,audit_reason,export_path,photo_id,batch_name,sheet_scan_id,crop_index",
-                "photo,landscape,photo_10.jpg,x,CROP,keep my note,high,0,0.00,ok,,/tmp/photo_10.jpg,10,batch-a,20,1",
+                "photo,landscape,photo_10.jpg,yes,MERGE,old note,high,0,0.00,ok,,/tmp/photo_10.jpg,10,batch-a,20,1",
             ]
         ),
         encoding="utf-8",
@@ -246,15 +229,36 @@ def test_write_audit_csv_preserves_manual_issue_over_model_default(tmp_path) -> 
         row = next(row for row in csv.DictReader(handle) if row["row_type"] == "photo")
 
     assert row["needs_help"] == "x"
-    assert row["issue"] == "CROP"
-    assert row["notes"] == "keep my note"
+    assert row["issue"] == "R180"
+    assert row["notes"] == ""
 
 
-def test_write_audit_csv_clears_preserved_manual_fields_after_recent_fix(
-    tmp_path,
-    app_config,
-    monkeypatch,
-) -> None:
+def test_should_auto_prefill_issue_rejects_merge_suggestions() -> None:
+    finding = ExportAuditFinding(
+        photo_id=10,
+        batch_name="batch-a",
+        sheet_scan_id=20,
+        crop_index=1,
+        category="merged_detection",
+        reason="vision audit suggests MERGE",
+        export_path=Path("/tmp/photo_10.jpg"),
+        auto_rotation_suggestion=0,
+        auto_rotation_confidence=0.0,
+        review_priority="high",
+        suggested_issue="MERGE",
+        suggested_issue_confidence=0.99,
+        suggested_issue_reason="vision audit suggests MERGE",
+    )
+
+    assert _should_auto_prefill_issue(finding) is False
+    assert _default_manual_fields_for_finding(finding) == {
+        "needs_help": "",
+        "issue": "",
+        "notes": "",
+    }
+
+
+def test_write_audit_csv_clears_stale_manual_fields_after_refresh(tmp_path) -> None:
     csv_path = tmp_path / "export_audit.csv"
     csv_path.write_text(
         "\n".join(
@@ -264,10 +268,6 @@ def test_write_audit_csv_clears_preserved_manual_fields_after_recent_fix(
             ]
         ),
         encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        "audit.service._photo_ids_with_resolved_export_audit_fixes",
-        lambda config: {"10"},
     )
     findings = [
         ExportAuditFinding(
@@ -287,7 +287,7 @@ def test_write_audit_csv_clears_preserved_manual_fields_after_recent_fix(
         )
     ]
 
-    _write_audit_csv(csv_path, findings, config=app_config)
+    _write_audit_csv(csv_path, findings)
 
     with csv_path.open("r", encoding="utf-8", newline="") as handle:
         row = next(row for row in csv.DictReader(handle) if row["row_type"] == "photo")
@@ -295,6 +295,50 @@ def test_write_audit_csv_clears_preserved_manual_fields_after_recent_fix(
     assert row["needs_help"] == ""
     assert row["issue"] == ""
     assert row["notes"] == ""
+
+
+def test_write_audit_csv_preserves_open_review_task_manual_fields(
+    tmp_path,
+    app_config,
+    monkeypatch,
+) -> None:
+    csv_path = tmp_path / "export_audit.csv"
+    findings = [
+        ExportAuditFinding(
+            photo_id=951,
+            batch_name="batch-a",
+            sheet_scan_id=545,
+            crop_index=1,
+            category="ok",
+            reason="no audit issue detected",
+            export_path=tmp_path / "staging" / "photo_951.jpg",
+            auto_rotation_suggestion=0,
+            auto_rotation_confidence=0.25,
+            review_priority="low",
+            suggested_issue=None,
+            suggested_issue_confidence=None,
+            suggested_issue_reason=None,
+        )
+    ]
+    monkeypatch.setattr(
+        "audit.service._open_export_audit_manual_fields",
+        lambda config: {
+            "951": {
+                "needs_help": "yes",
+                "issue": "MERGE",
+                "notes": "manual judgment wins",
+            }
+        },
+    )
+
+    _write_audit_csv(csv_path, findings, config=app_config)
+
+    with csv_path.open("r", encoding="utf-8", newline="") as handle:
+        row = next(row for row in csv.DictReader(handle) if row["row_type"] == "photo")
+
+    assert row["needs_help"] == "yes"
+    assert row["issue"] == "MERGE"
+    assert row["notes"] == "manual judgment wins"
 
 
 def test_classify_record_uses_model_merge_decision(monkeypatch, tmp_path) -> None:

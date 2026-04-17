@@ -96,6 +96,7 @@ def list_export_ready_photo_ids(
     batch_name: str | None = None,
     sheet_id: int | None = None,
     photo_id: int | None = None,
+    exclude_final_exported: bool = False,
     limit: int | None = None,
 ) -> list[int]:
     """Return enhanced photo ids that are ready for frame export."""
@@ -121,6 +122,17 @@ def list_export_ready_photo_ids(
     if photo_id is not None:
         clauses.append("p.id = %s")
         params.append(photo_id)
+    if exclude_final_exported:
+        clauses.append(
+            """
+            NOT EXISTS (
+                SELECT 1
+                FROM photo_artifacts pa
+                WHERE pa.photo_id = p.id
+                  AND pa.artifact_type = 'frame_export'
+            )
+            """.strip()
+        )
     query += " AND " + " AND ".join(clauses)
     query += " ORDER BY p.id"
     if limit is not None:

@@ -56,7 +56,7 @@ class FrameExportSummary:
 class PromoteExportsSummary:
     """Summary of promoting reviewed staging exports into final frame folders."""
 
-    csv_path: Path
+    csv_path: Path | None
     promoted_count: int
     skipped_count: int
     dry_run: bool
@@ -247,14 +247,16 @@ def resolve_frame_export_request(
 def promote_staging_exports(
     config: AppConfig,
     *,
-    csv_path: Path,
+    csv_path: Path | None,
     dry_run: bool,
 ) -> PromoteExportsSummary:
-    """Promote staging exports with no flagged issues into final frame folders."""
-    if not csv_path.exists():
-        raise ValueError(f"Export audit CSV was not found: {csv_path}")
-
-    rows = _read_promotable_rows(csv_path)
+    """Promote staging exports into final frame folders."""
+    if csv_path is None:
+        rows = _read_staging_promotable_rows(config)
+    else:
+        if not csv_path.exists():
+            raise ValueError(f"Export audit CSV was not found: {csv_path}")
+        rows = _read_promotable_rows(csv_path)
     promoted_count = 0
     skipped_count = 0
 
@@ -387,13 +389,86 @@ def _write_frame_export(
     resized_height = max(1, int(round(source_height * scale)))
     resized = cv2.resize(image, (resized_width, resized_height), interpolation=cv2.INTER_AREA)
 
-    x_offset = max(0, (resized_width - width_px) // 2)
-    y_offset = max(0, (resized_height - height_px) // 2)
+    x_offset, y_offset = _compute_face_aware_crop_offsets(
+        image=resized,
+        crop_width=width_px,
+        crop_height=height_px,
+    )
     composite = resized[y_offset:y_offset + height_px, x_offset:x_offset + width_px]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if not cv2.imwrite(str(output_path), composite):
         raise ValueError(f"Failed to write frame export image: {output_path}")
+
+
+def _compute_face_aware_crop_offsets(
+    *,
+    image,
+    crop_width: int,
+    crop_height: int,
+) -> tuple[int, int]:
+    image_height, image_width = image.shape[:2]
+    default_x = max(0, (image_width - crop_width) // 2)
+    default_y = max(0, (image_height - crop_height) // 2)
+    face_boxes = _detect_face_boxes(image)
+    if not face_boxes:
+        return default_x, default_y
+
+    min_x = min(x for x, _, _, _ in face_boxes)
+    min_y = min(y for _, y, _, _ in face_boxes)
+    max_x = max(x + w for x, _, w, _ in face_boxes)
+    max_y = max(y + h for _, y, _, h in face_boxes)
+    margin_x = max(8, crop_width // 20)
+    margin_y = max(12, crop_height // 12)
+
+    x_offset = _clamp_crop_offset(
+        default_offset=default_x,
+        face_min=min_x,
+        face_max=max_x,
+        crop_size=crop_width,
+        image_size=image_width,
+        margin=margin_x,
+    )
+    y_offset = _clamp_crop_offset(
+        default_offset=default_y,
+        face_min=min_y,
+        face_max=max_y,
+        crop_size=crop_height,
+        image_size=image_height,
+        margin=margin_y,
+    )
+    return x_offset, y_offset
+
+
+def _clamp_crop_offset(
+    *,
+    default_offset: int,
+    face_min: int,
+    face_max: int,
+    crop_size: int,
+    image_size: int,
+    margin: int,
+) -> int:
+    max_offset = max(0, image_size - crop_size)
+    lower_bound = max(0, face_max + margin - crop_size)
+    upper_bound = min(max_offset, face_min - margin)
+    if lower_bound <= upper_bound:
+        return max(lower_bound, min(default_offset, upper_bound))
+
+    face_center = (face_min + face_max) / 2.0
+    centered_offset = int(round(face_center - (crop_size / 2.0)))
+    return max(0, min(centered_offset, max_offset))
+
+
+def _detect_face_boxes(image) -> tuple[tuple[int, int, int, int], ...]:
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    classifier = cv2.CascadeClassifier(str(cascade_path))
+    if classifier.empty():
+        return ()
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    faces = classifier.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
+    return tuple((int(x), int(y), int(w), int(h)) for x, y, w, h in faces)
 
 
 def _target_name(
@@ -469,6 +544,29 @@ def _read_promotable_rows(csv_path: Path) -> list[dict[str, str]]:
                 continue
             rows.append(normalized)
         return rows
+
+
+def _read_staging_promotable_rows(config: AppConfig) -> list[dict[str, str]]:
+    with connect(config) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT photo_id, path
+                FROM photo_artifacts
+                WHERE artifact_type = %s
+                ORDER BY photo_id
+                """,
+                (STAGING_FRAME_EXPORT_ARTIFACT_TYPE,),
+            )
+            return [
+                {
+                    "photo_id": str(int(photo_id)),
+                    "export_path": str(path),
+                    "needs_help": "",
+                    "issue": "",
+                }
+                for photo_id, path in cur.fetchall()
+            ]
 
 
 def _row_needs_help(row: dict[str, str]) -> bool:
