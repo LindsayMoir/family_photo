@@ -1,0 +1,14 @@
+{
+  "photo_id": "470",
+  "export_filename": "photo_470.jpg",
+  "manual_issue": "CROP",
+  "manual_issue_codes": [
+    "CROP"
+  ],
+  "manual_primary_issue": "CROP",
+  "manual_notes": "Right side needs to be trimmed about 13%",
+  "model_issue": "OK",
+  "model_confidence": 0.9,
+  "model_reason": "The image appears correctly framed and oriented with no visible skew or clipping. There is a single photo in the frame, so no merge is necessary.",
+  "agree": false
+}

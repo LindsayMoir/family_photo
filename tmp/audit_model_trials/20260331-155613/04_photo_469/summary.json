@@ -1,0 +1,14 @@
+{
+  "photo_id": "469",
+  "export_filename": "photo_469.jpg",
+  "manual_issue": "CROP",
+  "manual_issue_codes": [
+    "CROP"
+  ],
+  "manual_primary_issue": "CROP",
+  "manual_notes": "Left needs to be trimmed about 10%",
+  "model_issue": "OK",
+  "model_confidence": 0.9,
+  "model_reason": "The image framing is appropriate, without multiple adjacent photos, clipping, skew, or obvious incorrect rotation.",
+  "agree": false
+}

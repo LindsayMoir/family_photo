@@ -1,0 +1,14 @@
+{
+  "photo_id": "491",
+  "export_filename": "photo_491.jpg",
+  "manual_issue": "CROP",
+  "manual_issue_codes": [
+    "CROP"
+  ],
+  "manual_primary_issue": "CROP",
+  "manual_notes": "Right 10%",
+  "model_issue": "OK",
+  "model_confidence": 0.9,
+  "model_reason": "The photo is well framed, not tilted, no rotation needed, and contains a single image with no clipping or merging required.",
+  "agree": false
+}

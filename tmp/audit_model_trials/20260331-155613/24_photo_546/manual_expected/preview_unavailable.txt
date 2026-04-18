@@ -1,0 +1,1 @@
+Split preview unavailable: less than two regions detected.

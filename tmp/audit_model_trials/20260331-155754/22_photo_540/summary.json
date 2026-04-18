@@ -1,0 +1,14 @@
+{
+  "photo_id": "540",
+  "export_filename": "photo_540.jpg",
+  "manual_issue": "MERGE",
+  "manual_issue_codes": [
+    "MERGE"
+  ],
+  "manual_primary_issue": "MERGE",
+  "manual_notes": "",
+  "model_issue": "MERGE",
+  "model_confidence": 0.9,
+  "model_reason": "The image contains multiple adjacent printed photos that should be split.",
+  "agree": true
+}

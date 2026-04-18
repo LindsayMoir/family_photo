@@ -1,0 +1,10 @@
+{
+  "photo_id": "546",
+  "export_filename": "photo_546.jpg",
+  "manual_issue": "MERGE",
+  "manual_notes": "",
+  "model_issue": "RR90",
+  "model_confidence": 0.95,
+  "model_reason": "The image is rotated 90 degrees counterclockwise, as indicated by the orientation of the people and the water flow which should be upright.",
+  "agree": false
+}

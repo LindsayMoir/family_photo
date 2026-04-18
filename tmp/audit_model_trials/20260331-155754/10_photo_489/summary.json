@@ -1,0 +1,14 @@
+{
+  "photo_id": "489",
+  "export_filename": "photo_489.jpg",
+  "manual_issue": "R180",
+  "manual_issue_codes": [
+    "R180"
+  ],
+  "manual_primary_issue": "R180",
+  "manual_notes": "",
+  "model_issue": "RR90",
+  "model_confidence": 0.95,
+  "model_reason": "The image is rotated 90 degrees clockwise and needs a right rotation of 90 degrees (RR90) to be oriented correctly.",
+  "agree": false
+}

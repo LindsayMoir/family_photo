@@ -1,0 +1,14 @@
+{
+  "photo_id": "578",
+  "export_filename": "photo_578.jpg",
+  "manual_issue": "DELETE",
+  "manual_issue_codes": [
+    "DELETE"
+  ],
+  "manual_primary_issue": "DELETE",
+  "manual_notes": "",
+  "model_issue": "OK",
+  "model_confidence": 0.9,
+  "model_reason": "The image is well framed with no clipping, no adjacent photos, no skew or need for rotation.",
+  "agree": false
+}

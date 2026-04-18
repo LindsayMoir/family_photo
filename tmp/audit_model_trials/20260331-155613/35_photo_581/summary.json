@@ -1,0 +1,14 @@
+{
+  "photo_id": "581",
+  "export_filename": "photo_581.jpg",
+  "manual_issue": "CROP",
+  "manual_issue_codes": [
+    "CROP"
+  ],
+  "manual_primary_issue": "CROP",
+  "manual_notes": "Right 15%",
+  "model_issue": "CROP",
+  "model_confidence": 0.9,
+  "model_reason": "The image contains partial clipping on the right side and possibly at the bottom, indicating framing is not ideal.",
+  "agree": true
+}

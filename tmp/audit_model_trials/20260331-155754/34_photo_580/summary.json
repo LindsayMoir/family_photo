@@ -1,0 +1,15 @@
+{
+  "photo_id": "580",
+  "export_filename": "photo_580.jpg",
+  "manual_issue": "SKEW, R180",
+  "manual_issue_codes": [
+    "SKEW",
+    "R180"
+  ],
+  "manual_primary_issue": "SKEW",
+  "manual_notes": "skew is 15% left",
+  "model_issue": "RL90",
+  "model_confidence": 0.95,
+  "model_reason": "The image is rotated 90 degrees counterclockwise, requiring a 90-degree clockwise rotation (RL90) to be upright.",
+  "agree": false
+}

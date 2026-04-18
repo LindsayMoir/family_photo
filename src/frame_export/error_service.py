@@ -13,22 +13,29 @@ from config import AppConfig
 from db.connection import connect
 from frame_export.service import (
     DEFAULT_FRAME_PROFILE,
+    DEFAULT_FRAME_WIDTH,
+    DEFAULT_FRAME_HEIGHT,
     FRAME_EXPORT_ARTIFACT_TYPE,
     FRAME_EXPORT_PIPELINE_VERSION,
     PORTRAIT_FRAME_PROFILE,
+    PORTRAIT_FRAME_WIDTH,
+    PORTRAIT_FRAME_HEIGHT,
     STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
     STAGING_LANDSCAPE_PROFILE,
     STAGING_PORTRAIT_PROFILE,
     stage_photo_exports,
 )
+from disposition.service import set_photo_export_disposition
 from photo_repository import (
     delete_photo_artifact,
     get_photo_record,
     insert_photo_artifact,
     list_export_ready_photo_ids,
     list_photo_artifact_paths,
+    list_photo_ids,
     update_photo_stage,
 )
+from review.service import resolve_export_audit_review, resolve_orientation_review_for_photo
 
 
 _PHOTO_ID_RE = re.compile(r"(?:^|[/\\])photo_(?P<photo_id>\d+)\.jpg$", re.IGNORECASE)
@@ -314,6 +321,20 @@ def stage_next_exports_for_audit(
         if csv_path is not None
         else config.photos_root / "exports" / "staging" / "export_audit.csv"
     )
+    if not dry_run:
+        from audit.service import _reconcile_staging_export_artifacts
+
+        with connect(config) as conn:
+            _reconcile_staging_export_artifacts(
+                conn,
+                config,
+                batch_name=batch_name,
+                sheet_id=sheet_id,
+                photo_id=None,
+                limit=None,
+            )
+            conn.commit()
+
     with connect(config) as conn:
         photo_ids = list_export_ready_photo_ids(
             conn,
@@ -338,6 +359,12 @@ def stage_next_exports_for_audit(
             dry_run=True,
         )
 
+    _clear_unselected_staging_exports(
+        config,
+        batch_name=batch_name,
+        sheet_id=sheet_id,
+        keep_photo_ids=set(photo_ids),
+    )
     stage_photo_exports(config, photo_ids=photo_ids, dry_run=False)
 
     from audit.service import _classify_records, _write_audit_csv
@@ -421,15 +448,12 @@ def apply_manual_staging_edits(
         _stage_exact_manual_edits(config, photo_ids=sorted(direct_edits))
 
     if split_groups:
-        from audit.fix_service import manual_split_photo
-
         for photo_id, input_paths in split_groups.items():
-            manual_split_photo(
+            _apply_exact_manual_split(
                 config,
                 photo_id=photo_id,
                 input_paths=list(input_paths),
                 note="manual split from staging/temp",
-                dry_run=False,
             )
             for path in input_paths:
                 path.unlink()
@@ -449,12 +473,23 @@ def _stage_exact_manual_edits(
     photo_ids: list[int],
 ) -> None:
     with connect(config) as conn:
-        for photo_id in photo_ids:
-            photo = get_photo_record(conn, photo_id=photo_id)
-            working_path = config.photos_root.parent / photo.working_path
-            image = cv2.imread(str(working_path))
+        source_paths = {
+            photo_id: config.photos_root.parent / get_photo_record(conn, photo_id=photo_id).working_path
+            for photo_id in photo_ids
+        }
+    _stage_exact_photo_sources(config, photo_sources=source_paths)
+
+
+def _stage_exact_photo_sources(
+    config: AppConfig,
+    *,
+    photo_sources: dict[int, Path],
+) -> None:
+    with connect(config) as conn:
+        for photo_id, source_path in photo_sources.items():
+            image = cv2.imread(str(source_path))
             if image is None:
-                raise ValueError(f"Unable to load operator-edited working image: {working_path}")
+                raise ValueError(f"Unable to load operator-edited image: {source_path}")
             profile = _staging_profile_for_manual_image(image)
             output_path = config.photos_root / 'exports' / profile / f'photo_{photo_id}.jpg'
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -463,7 +498,7 @@ def _stage_exact_manual_edits(
                 photo_id=photo_id,
                 artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
             )
-            shutil.copy2(working_path, output_path)
+            shutil.copy2(source_path, output_path)
             insert_photo_artifact(
                 conn,
                 photo_id=photo_id,
@@ -477,9 +512,93 @@ def _stage_exact_manual_edits(
 
 def _staging_profile_for_manual_image(image) -> str:
     height, width = image.shape[:2]
-    if height > width:
-        return STAGING_PORTRAIT_PROFILE
-    return STAGING_LANDSCAPE_PROFILE
+    return _closest_profile_for_dimensions(
+        width=width,
+        height=height,
+        landscape_profile=STAGING_LANDSCAPE_PROFILE,
+        portrait_profile=STAGING_PORTRAIT_PROFILE,
+    )
+
+
+def _closest_profile_for_dimensions(
+    *,
+    width: int,
+    height: int,
+    landscape_profile: str,
+    portrait_profile: str,
+) -> str:
+    landscape_mismatch = abs((width / DEFAULT_FRAME_WIDTH) - (height / DEFAULT_FRAME_HEIGHT))
+    portrait_mismatch = abs((width / PORTRAIT_FRAME_WIDTH) - (height / PORTRAIT_FRAME_HEIGHT))
+    if landscape_mismatch == portrait_mismatch:
+        return landscape_profile if width >= height else portrait_profile
+    return landscape_profile if landscape_mismatch < portrait_mismatch else portrait_profile
+
+
+def _apply_exact_manual_split(
+    config: AppConfig,
+    *,
+    photo_id: int,
+    input_paths: list[Path],
+    note: str | None,
+) -> list[int]:
+    from audit.fix_service import (
+        _find_open_export_audit_task_id,
+        _get_photo_repair_context,
+        _load_manual_split_image,
+        _resolve_manual_split_inputs,
+        _rewrite_split_photo_arrays,
+    )
+
+    resolved_input_paths = _resolve_manual_split_inputs(input_paths)
+    context = _get_photo_repair_context(config, photo_id=photo_id)
+    crops = [_load_manual_split_image(path) for path in resolved_input_paths]
+    new_photo_ids = _rewrite_split_photo_arrays(
+        config,
+        context=context,
+        crops=crops,
+        pipeline_version='manual_split_v1',
+        reuse_original_photo=False,
+    )
+    if not new_photo_ids:
+        raise ValueError(f"Manual split did not create any child photos for photo_id={photo_id}.")
+
+    set_photo_export_disposition(
+        config,
+        photo_id=context.photo_id,
+        disposition='exclude_reject',
+        note='replaced by manual split children',
+        dry_run=False,
+    )
+
+    with connect(config) as conn:
+        source_paths = {
+            current_photo_id: config.photos_root.parent / get_photo_record(conn, photo_id=current_photo_id).raw_crop_path
+            for current_photo_id in new_photo_ids
+        }
+    _stage_exact_photo_sources(config, photo_sources=source_paths)
+
+    resolved_task_id = _find_open_export_audit_task_id(config, photo_id=photo_id)
+    if resolved_task_id is not None:
+        resolve_export_audit_review(
+            config,
+            task_id=resolved_task_id,
+            export_action='fix_crop',
+            note=note or 'manual split applied',
+            dry_run=False,
+        )
+    resolve_orientation_review_for_photo(
+        config,
+        photo_id=context.photo_id,
+        action='excluded_via_manual_split',
+    )
+    for current_photo_id in new_photo_ids:
+        resolve_orientation_review_for_photo(
+            config,
+            photo_id=current_photo_id,
+            action='fixed_via_manual_split',
+        )
+
+    return new_photo_ids
 
 
 def _classify_manual_edit_entries(
@@ -555,3 +674,37 @@ def _clear_existing_artifacts(
         )
         if existing_path.exists():
             existing_path.unlink()
+
+
+def _clear_unselected_staging_exports(
+    config: AppConfig,
+    *,
+    batch_name: str | None,
+    sheet_id: int | None,
+    keep_photo_ids: set[int],
+) -> None:
+    with connect(config) as conn:
+        candidate_photo_ids = list_photo_ids(
+            conn,
+            batch_name=batch_name,
+            sheet_id=sheet_id,
+            photo_id=None,
+            limit=None,
+        )
+        for photo_id in candidate_photo_ids:
+            if photo_id in keep_photo_ids:
+                continue
+            for existing_path in list_photo_artifact_paths(
+                conn,
+                photo_id=photo_id,
+                artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+            ):
+                delete_photo_artifact(
+                    conn,
+                    photo_id=photo_id,
+                    artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+                    path=existing_path,
+                )
+                if existing_path.exists():
+                    existing_path.unlink()
+        conn.commit()

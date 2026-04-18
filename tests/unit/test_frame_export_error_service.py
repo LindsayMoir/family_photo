@@ -8,6 +8,7 @@ import pytest
 
 from audit.models import ExportAuditFinding, ExportAuditSummary
 from frame_export.error_service import (
+    _closest_profile_for_dimensions,
     _photo_id_from_error_entry,
     _read_error_entries,
     _resolve_error_photo_ids,
@@ -249,6 +250,128 @@ def test_requeue_final_exports_for_audit_moves_portrait_exports_to_staging(
     ]
 
 
+def test_stage_next_exports_for_audit_reconciles_missing_staging_files_before_selection(
+    app_config,
+    monkeypatch,
+) -> None:
+    reconciled: list[tuple[str | None, int | None, int | None, int | None]] = []
+    selection_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr("frame_export.error_service.connect", _fake_connect)
+    monkeypatch.setattr(
+        "audit.service._reconcile_staging_export_artifacts",
+        lambda conn, config, batch_name, sheet_id, photo_id, limit: reconciled.append(
+            (batch_name, sheet_id, photo_id, limit)
+        ),
+    )
+    monkeypatch.setattr(
+        "frame_export.error_service.list_export_ready_photo_ids",
+        lambda conn, **kwargs: selection_calls.append(kwargs) or [951],
+    )
+    monkeypatch.setattr(
+        "frame_export.error_service._clear_unselected_staging_exports",
+        lambda config, batch_name, sheet_id, keep_photo_ids: None,
+    )
+    monkeypatch.setattr(
+        "frame_export.error_service.stage_photo_exports",
+        lambda config, photo_ids, dry_run: None,
+    )
+    monkeypatch.setattr(
+        "photo_repository.list_export_audit_records",
+        lambda conn, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "audit.service._classify_records",
+        lambda records, config: [],
+    )
+    monkeypatch.setattr(
+        "audit.service._open_export_audit_manual_fields",
+        lambda config: {},
+    )
+
+    summary = stage_next_exports_for_audit(
+        app_config,
+        batch_name="batch-a",
+        sheet_id=None,
+        limit=20,
+        csv_path=None,
+        dry_run=False,
+    )
+
+    assert summary.selected_count == 1
+    assert reconciled == [("batch-a", None, None, None)]
+    assert selection_calls == [
+        {
+            "batch_name": "batch-a",
+            "sheet_id": None,
+            "photo_id": None,
+            "exclude_final_exported": True,
+            "limit": 20,
+        }
+    ]
+
+
+def test_stage_next_exports_for_audit_clears_unselected_staging_exports(
+    app_config,
+    monkeypatch,
+) -> None:
+    selection_calls: list[dict[str, object]] = []
+    cleared: list[tuple[str | None, int | None, set[int]]] = []
+    staged: list[int] = []
+
+    monkeypatch.setattr("frame_export.error_service.connect", _fake_connect)
+    monkeypatch.setattr(
+        "audit.service._reconcile_staging_export_artifacts",
+        lambda conn, config, batch_name, sheet_id, photo_id, limit: None,
+    )
+    monkeypatch.setattr(
+        "frame_export.error_service.list_export_ready_photo_ids",
+        lambda conn, **kwargs: selection_calls.append(kwargs) or [951, 952],
+    )
+    monkeypatch.setattr(
+        "frame_export.error_service._clear_unselected_staging_exports",
+        lambda config, batch_name, sheet_id, keep_photo_ids: cleared.append((batch_name, sheet_id, set(keep_photo_ids))),
+    )
+    monkeypatch.setattr(
+        "frame_export.error_service.stage_photo_exports",
+        lambda config, photo_ids, dry_run: staged.extend(photo_ids),
+    )
+    monkeypatch.setattr(
+        "photo_repository.list_export_audit_records",
+        lambda conn, **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "audit.service._classify_records",
+        lambda records, config: [],
+    )
+    monkeypatch.setattr(
+        "audit.service._open_export_audit_manual_fields",
+        lambda config: {},
+    )
+
+    summary = stage_next_exports_for_audit(
+        app_config,
+        batch_name="batch-a",
+        sheet_id=None,
+        limit=20,
+        csv_path=None,
+        dry_run=False,
+    )
+
+    assert summary.selected_count == 2
+    assert cleared == [("batch-a", None, {951, 952})]
+    assert staged == [951, 952]
+    assert selection_calls == [
+        {
+            "batch_name": "batch-a",
+            "sheet_id": None,
+            "photo_id": None,
+            "exclude_final_exported": True,
+            "limit": 20,
+        }
+    ]
+
+
 def test_stage_next_exports_for_audit_stages_selected_export_ready_ids(
     app_config,
     monkeypatch,
@@ -257,8 +380,16 @@ def test_stage_next_exports_for_audit_stages_selected_export_ready_ids(
     selection_calls: list[dict[str, object]] = []
     monkeypatch.setattr("frame_export.error_service.connect", _fake_connect)
     monkeypatch.setattr(
+        "audit.service._reconcile_staging_export_artifacts",
+        lambda conn, config, batch_name, sheet_id, photo_id, limit: None,
+    )
+    monkeypatch.setattr(
         "frame_export.error_service.list_export_ready_photo_ids",
         lambda conn, **kwargs: selection_calls.append(kwargs) or [951, 952],
+    )
+    monkeypatch.setattr(
+        "frame_export.error_service._clear_unselected_staging_exports",
+        lambda config, batch_name, sheet_id, keep_photo_ids: None,
     )
     staged: list[int] = []
     monkeypatch.setattr(
@@ -535,17 +666,11 @@ def test_apply_manual_staging_edits_processes_manual_split_groups(
 
     monkeypatch.setattr("frame_export.error_service.connect", _fake_connect)
     monkeypatch.setattr(
-        "audit.fix_service.manual_split_photo",
-        lambda config, photo_id, input_paths, note, dry_run: split_calls.append(
-            (photo_id, [str(path) for path in input_paths], note, dry_run)
+        "frame_export.error_service._apply_exact_manual_split",
+        lambda config, photo_id, input_paths, note: split_calls.append(
+            (photo_id, [str(path) for path in input_paths], note)
         )
-        or type(
-            "Summary",
-            (),
-            {
-                "staged_photo_ids": (1146, 1201),
-            },
-        )(),
+        or [1201, 1202],
     )
 
     summary = apply_manual_staging_edits(
@@ -562,7 +687,6 @@ def test_apply_manual_staging_edits_processes_manual_split_groups(
             1146,
             [str(split_left), str(split_right)],
             "manual split from staging/temp",
-            False,
         )
     ]
     assert not split_left.exists()
@@ -587,3 +711,18 @@ def test_apply_manual_staging_edits_rejects_mixed_direct_and_split_entries_for_s
             temp_dir=None,
             dry_run=False,
         )
+
+
+def test_closest_profile_for_dimensions_prefers_nearest_frame_shape() -> None:
+    assert _closest_profile_for_dimensions(
+        width=875,
+        height=918,
+        landscape_profile="landscape",
+        portrait_profile="portrait",
+    ) == "portrait"
+    assert _closest_profile_for_dimensions(
+        width=1080,
+        height=922,
+        landscape_profile="landscape",
+        portrait_profile="portrait",
+    ) == "landscape"

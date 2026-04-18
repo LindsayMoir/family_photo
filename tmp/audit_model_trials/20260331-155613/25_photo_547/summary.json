@@ -1,0 +1,14 @@
+{
+  "photo_id": "547",
+  "export_filename": "photo_547.jpg",
+  "manual_issue": "DELETE",
+  "manual_issue_codes": [
+    "DELETE"
+  ],
+  "manual_primary_issue": "DELETE",
+  "manual_notes": "",
+  "model_issue": "RL90",
+  "model_confidence": 0.9,
+  "model_reason": "The image is clearly rotated 90 degrees counter-clockwise from a normal upright orientation.",
+  "agree": false
+}

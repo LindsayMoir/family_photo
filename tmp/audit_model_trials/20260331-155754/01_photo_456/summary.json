@@ -1,0 +1,14 @@
+{
+  "photo_id": "456",
+  "export_filename": "photo_456.jpg",
+  "manual_issue": "SKEW",
+  "manual_issue_codes": [
+    "SKEW"
+  ],
+  "manual_primary_issue": "SKEW",
+  "manual_notes": "10% left",
+  "model_issue": "SKEW",
+  "model_confidence": 0.85,
+  "model_reason": "The image is tilted by a small angle to the right, but the framing is otherwise correct and contains a single photo.",
+  "agree": true
+}

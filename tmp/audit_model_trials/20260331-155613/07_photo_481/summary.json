@@ -1,0 +1,14 @@
+{
+  "photo_id": "481",
+  "export_filename": "photo_481.jpg",
+  "manual_issue": "CROP",
+  "manual_issue_codes": [
+    "CROP"
+  ],
+  "manual_primary_issue": "CROP",
+  "manual_notes": "Right 15%",
+  "model_issue": "OK",
+  "model_confidence": 0.9,
+  "model_reason": "The image shows a single printed photo centered well with no tilt, rotation, cropping, or multiple adjacent photos needing splitting.",
+  "agree": false
+}

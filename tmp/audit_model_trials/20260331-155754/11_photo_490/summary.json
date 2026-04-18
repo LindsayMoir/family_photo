@@ -1,0 +1,14 @@
+{
+  "photo_id": "490",
+  "export_filename": "photo_490.jpg",
+  "manual_issue": "CROP",
+  "manual_issue_codes": [
+    "CROP"
+  ],
+  "manual_primary_issue": "CROP",
+  "manual_notes": "LEFT 40% and becomes portrait",
+  "model_issue": "CROP",
+  "model_confidence": 0.85,
+  "model_reason": "The image content is partially clipped on the left side and appears to have framing issues as part of the photo's edge is visible.",
+  "agree": true
+}

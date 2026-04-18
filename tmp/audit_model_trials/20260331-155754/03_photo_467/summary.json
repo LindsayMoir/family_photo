@@ -1,0 +1,15 @@
+{
+  "photo_id": "467",
+  "export_filename": "photo_467.jpg",
+  "manual_issue": "R180, CROP",
+  "manual_issue_codes": [
+    "R180",
+    "CROP"
+  ],
+  "manual_primary_issue": "R180",
+  "manual_notes": "Right needs to be trimmed about 2%",
+  "model_issue": "RR90",
+  "model_confidence": 0.95,
+  "model_reason": "The image appears to be rotated 90 degrees to the left and should be rotated 90 degrees to the right to be upright.",
+  "agree": false
+}

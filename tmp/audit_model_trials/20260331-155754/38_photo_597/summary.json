@@ -1,0 +1,14 @@
+{
+  "photo_id": "597",
+  "export_filename": "photo_597.jpg",
+  "manual_issue": "MERGE",
+  "manual_issue_codes": [
+    "MERGE"
+  ],
+  "manual_primary_issue": "MERGE",
+  "manual_notes": "",
+  "model_issue": "MERGE",
+  "model_confidence": 0.95,
+  "model_reason": "The image contains multiple adjacent printed photos that should be split, evident from the visible divide and partial duplicate person on the right.",
+  "agree": true
+}

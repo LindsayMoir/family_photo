@@ -1,0 +1,10 @@
+{
+  "photo_id": "524",
+  "export_filename": "photo_524.jpg",
+  "manual_issue": "MERGE",
+  "manual_notes": "",
+  "model_issue": "R180",
+  "model_confidence": 0.9,
+  "model_reason": "The entire image is upside-down and needs a 180-degree rotation to be correct.",
+  "agree": false
+}

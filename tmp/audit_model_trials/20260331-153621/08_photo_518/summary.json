@@ -1,0 +1,10 @@
+{
+  "photo_id": "518",
+  "export_filename": "photo_518.jpg",
+  "manual_issue": "R180",
+  "manual_notes": "",
+  "model_issue": "R180",
+  "model_confidence": 0.95,
+  "model_reason": "The image is upside down and requires a 180-degree rotation for correct orientation.",
+  "agree": true
+}

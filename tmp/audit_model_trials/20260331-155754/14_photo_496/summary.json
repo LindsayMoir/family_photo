@@ -1,0 +1,14 @@
+{
+  "photo_id": "496",
+  "export_filename": "photo_496.jpg",
+  "manual_issue": "CROP",
+  "manual_issue_codes": [
+    "CROP"
+  ],
+  "manual_primary_issue": "CROP",
+  "manual_notes": "Right 3%",
+  "model_issue": "SKEW",
+  "model_confidence": 0.85,
+  "model_reason": "The image appears slightly tilted, indicating a small skew that affects the alignment.",
+  "agree": false
+}

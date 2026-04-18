@@ -1,0 +1,10 @@
+{
+  "photo_id": "528",
+  "export_filename": "photo_528.jpg",
+  "manual_issue": "MERGE",
+  "manual_notes": "",
+  "model_issue": "RR90",
+  "model_confidence": 0.95,
+  "model_reason": "The image is clearly rotated 90 degrees clockwise and needs a right rotation to be oriented correctly.",
+  "agree": false
+}

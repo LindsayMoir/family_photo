@@ -1,0 +1,14 @@
+{
+  "photo_id": "484",
+  "export_filename": "photo_484.jpg",
+  "manual_issue": "CROP",
+  "manual_issue_codes": [
+    "CROP"
+  ],
+  "manual_primary_issue": "CROP",
+  "manual_notes": "Right 7%",
+  "model_issue": "CROP",
+  "model_confidence": 0.85,
+  "model_reason": "The bottom right corner of the photo is clipped, cutting off part of the image content.",
+  "agree": true
+}
