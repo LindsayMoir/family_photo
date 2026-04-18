@@ -18,6 +18,7 @@ from photo_repository import (
     insert_photo_artifact,
     list_photo_artifact_paths,
     list_export_ready_photo_ids,
+    update_photo_export_disposition,
 )
 
 
@@ -85,6 +86,7 @@ def run_frame_export(
     batch_name: str | None,
     sheet_id: int | None,
     photo_id: int | None,
+    exclude_final_exported: bool = False,
     limit: int | None,
     width_px: int,
     height_px: int,
@@ -101,6 +103,7 @@ def run_frame_export(
             batch_name=batch_name,
             sheet_id=sheet_id,
             photo_id=photo_id,
+            exclude_final_exported=exclude_final_exported,
             limit=limit,
         )
 
@@ -282,6 +285,18 @@ def promote_staging_exports(
             photo_id = int(row["photo_id"])
             staging_path = Path(row["export_path"])
             if not staging_path.exists():
+                update_photo_export_disposition(
+                    conn,
+                    photo_id=photo_id,
+                    disposition="exclude_reject",
+                    note="Manually deleted from staging before promotion",
+                )
+                delete_photo_artifact(
+                    conn,
+                    photo_id=photo_id,
+                    artifact_type=STAGING_FRAME_EXPORT_ARTIFACT_TYPE,
+                    path=staging_path,
+                )
                 skipped_count += 1
                 continue
 

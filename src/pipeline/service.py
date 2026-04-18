@@ -172,6 +172,7 @@ def run_batch(
             batch_name=batch_name,
             sheet_id=sheet_id,
             photo_id=None,
+            exclude_final_exported=True,
             limit=None,
             width_px=export_width,
             height_px=export_height,

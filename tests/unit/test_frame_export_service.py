@@ -9,6 +9,7 @@ from frame_export.service import (
     _compute_face_aware_crop_offsets,
     _detect_face_boxes,
     promote_staging_exports,
+    run_frame_export,
 )
 
 
@@ -139,3 +140,126 @@ def test_clamp_crop_offset_centers_on_face_when_margin_cannot_fit() -> None:
     )
 
     assert offset == 20
+
+
+def test_promote_staging_exports_deletes_stale_missing_staging_rows(
+    app_config,
+    monkeypatch,
+) -> None:
+    missing_staging_path = app_config.photos_root / "exports" / "staging" / "portrait" / "photo_952.jpg"
+    deleted: list[tuple[int, str, str]] = []
+    inserted: list[tuple[int, str, str]] = []
+    updated: list[tuple[int, str, str]] = []
+
+    class _FakeCursor:
+        def __init__(self) -> None:
+            self._rows: list[tuple[object, ...]] = []
+
+        def execute(self, query, params=None) -> None:
+            normalized = " ".join(str(query).split())
+            if "SELECT photo_id, path FROM photo_artifacts" in normalized:
+                self._rows = [(952, str(missing_staging_path))]
+            else:
+                self._rows = []
+
+        def fetchall(self):
+            return self._rows
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self) -> None:
+            return None
+
+    @contextmanager
+    def _fake_connect(_config):
+        yield _FakeConn()
+
+    monkeypatch.setattr("frame_export.service.connect", _fake_connect)
+    monkeypatch.setattr(
+        "frame_export.service.list_photo_artifact_paths",
+        lambda conn, photo_id, artifact_type: [],
+    )
+    monkeypatch.setattr(
+        "frame_export.service.insert_photo_artifact",
+        lambda conn, photo_id, artifact_type, path, pipeline_stage, pipeline_version: inserted.append(
+            (photo_id, artifact_type, str(path))
+        ),
+    )
+    monkeypatch.setattr(
+        "frame_export.service.delete_photo_artifact",
+        lambda conn, photo_id, artifact_type, path: deleted.append((photo_id, artifact_type, str(path))),
+    )
+    monkeypatch.setattr(
+        "frame_export.service.update_photo_export_disposition",
+        lambda conn, photo_id, disposition, note: updated.append((photo_id, disposition, note)),
+    )
+
+    summary = promote_staging_exports(
+        app_config,
+        csv_path=None,
+        dry_run=False,
+    )
+
+    assert summary.promoted_count == 0
+    assert summary.skipped_count == 1
+    assert inserted == []
+    assert updated == [(952, "exclude_reject", "Manually deleted from staging before promotion")]
+    assert deleted == [(952, "frame_export_staging", str(missing_staging_path))]
+
+
+def test_run_frame_export_can_exclude_already_promoted_photos(
+    app_config,
+    monkeypatch,
+) -> None:
+    captured_calls: list[dict[str, object]] = []
+
+    class _FakeConn:
+        def commit(self) -> None:
+            return None
+
+    @contextmanager
+    def _fake_connect(_config):
+        yield _FakeConn()
+
+    def _fake_list_export_ready_photo_ids(conn, **kwargs):
+        captured_calls.append(kwargs)
+        return []
+
+    monkeypatch.setattr("frame_export.service.connect", _fake_connect)
+    monkeypatch.setattr("frame_export.service.list_export_ready_photo_ids", _fake_list_export_ready_photo_ids)
+
+    try:
+        run_frame_export(
+            app_config,
+            batch_name="batch-a",
+            sheet_id=None,
+            photo_id=None,
+            exclude_final_exported=True,
+            limit=10,
+            width_px=1920,
+            height_px=1080,
+            profile_name="frame_auto",
+            dry_run=False,
+        )
+    except ValueError as exc:
+        assert str(exc) == "No photos found for target 'batch-a'."
+    else:
+        raise AssertionError("Expected run_frame_export to raise when no photos are returned.")
+
+    assert captured_calls == [
+        {
+            "batch_name": "batch-a",
+            "sheet_id": None,
+            "photo_id": None,
+            "exclude_final_exported": True,
+            "limit": 10,
+        }
+    ]

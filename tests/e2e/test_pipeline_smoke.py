@@ -13,6 +13,9 @@ def _unused_connect(_config):
 
 
 def test_run_batch_smoke_reports_exports_and_review_state(app_config, monkeypatch) -> None:
+    export_ready_calls: list[dict[str, object]] = []
+    frame_export_calls: list[dict[str, object]] = []
+
     monkeypatch.setattr(
         "pipeline.service.run_process",
         lambda *args, **kwargs: ProcessSummary(
@@ -23,22 +26,29 @@ def test_run_batch_smoke_reports_exports_and_review_state(app_config, monkeypatc
         ),
     )
     monkeypatch.setattr("pipeline.service.connect", _unused_connect)
-    monkeypatch.setattr("pipeline.service.list_export_ready_photo_ids", lambda *args, **kwargs: [301, 302])
+
+    def _fake_list_export_ready_photo_ids(*args, **kwargs):
+        export_ready_calls.append(kwargs)
+        return [301, 302]
+
+    monkeypatch.setattr("pipeline.service.list_export_ready_photo_ids", _fake_list_export_ready_photo_ids)
     monkeypatch.setattr(
         "pipeline.service.resolve_frame_export_request",
         lambda **kwargs: (1600, 1200, "archive"),
     )
-    monkeypatch.setattr(
-        "pipeline.service.run_frame_export",
-        lambda *args, **kwargs: FrameExportSummary(
+
+    def _fake_run_frame_export(*args, **kwargs):
+        frame_export_calls.append(kwargs)
+        return FrameExportSummary(
             target="sheet_id=31",
             exported_count=2,
             output_dir=app_config.photos_root / "exports" / "staging",
             width_px=1600,
             height_px=1200,
             dry_run=False,
-        ),
-    )
+        )
+
+    monkeypatch.setattr("pipeline.service.run_frame_export", _fake_run_frame_export)
     monkeypatch.setattr(
         "pipeline.service.get_task_summary",
         lambda *args, **kwargs: ReviewTaskSummary(task_counts={"review_orientation": 1}),
@@ -71,3 +81,17 @@ def test_run_batch_smoke_reports_exports_and_review_state(app_config, monkeypatc
     assert summary.review_task_counts == {"review_orientation": 1}
     assert summary.blocking_task is not None
     assert summary.blocking_task.entity_id == 31
+    assert export_ready_calls == [{"batch_name": None, "sheet_id": 31}]
+    assert frame_export_calls == [
+        {
+            "batch_name": None,
+            "sheet_id": 31,
+            "photo_id": None,
+            "exclude_final_exported": True,
+            "limit": None,
+            "width_px": 1600,
+            "height_px": 1200,
+            "profile_name": "archive",
+            "dry_run": False,
+        }
+    ]
