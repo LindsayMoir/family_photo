@@ -84,6 +84,16 @@ class ManualSplitSummary:
     dry_run: bool
 
 
+@dataclass(frozen=True, slots=True)
+class AutoSplitSummary:
+    """Summary of applying the automatic split detector to one photo."""
+
+    photo_id: int
+    staged_photo_ids: tuple[int, ...]
+    resolved_task_id: int | None
+    dry_run: bool
+
+
 def apply_export_audit_fixes(
     config: AppConfig,
     *,
@@ -210,6 +220,49 @@ def manual_split_photo(
     )
 
 
+def auto_split_photo(
+    config: AppConfig,
+    *,
+    photo_id: int,
+    note: str | None,
+    dry_run: bool,
+) -> AutoSplitSummary:
+    """Apply the automatic split detector to one photo and restage the results."""
+    if dry_run:
+        return AutoSplitSummary(
+            photo_id=photo_id,
+            staged_photo_ids=(photo_id,),
+            resolved_task_id=None,
+            dry_run=True,
+        )
+
+    photo_ids = _auto_split_photo_ids(
+        config,
+        photo_id=photo_id,
+    )
+    resolved_task_id = _find_open_export_audit_task_id(config, photo_id=photo_id)
+    if resolved_task_id is not None:
+        resolve_export_audit_review(
+            config,
+            task_id=resolved_task_id,
+            export_action="fix_crop",
+            note=note or "auto split applied",
+            dry_run=False,
+        )
+    for current_photo_id in photo_ids:
+        resolve_orientation_review_for_photo(
+            config,
+            photo_id=current_photo_id,
+            action="fixed_via_export_audit",
+        )
+    return AutoSplitSummary(
+        photo_id=photo_id,
+        staged_photo_ids=tuple(photo_ids),
+        resolved_task_id=resolved_task_id,
+        dry_run=False,
+    )
+
+
 def _is_supported_issue(task: ReviewTask) -> bool:
     issue_codes = _task_issue_codes(task)
     return bool(issue_codes) and _issue_codes_supported(issue_codes)
@@ -307,13 +360,24 @@ def _apply_split_fix(
     note: str | None,
 ) -> list[int]:
     del note
+    return _auto_split_photo_ids(
+        config,
+        photo_id=task.entity_id,
+    )
+
+
+def _auto_split_photo_ids(
+    config: AppConfig,
+    *,
+    photo_id: int,
+) -> list[int]:
     export_width, export_height, export_profile = resolve_frame_export_request(
         preset_name="auto",
         width_px=None,
         height_px=None,
         profile_name=None,
     )
-    context = _get_photo_repair_context(config, photo_id=task.entity_id)
+    context = _get_photo_repair_context(config, photo_id=photo_id)
     source_path = config.photos_root.parent / context.raw_crop_path
     image = cv2.imread(str(source_path))
     if image is None:

@@ -254,6 +254,22 @@ def promote_staging_exports(
     dry_run: bool,
 ) -> PromoteExportsSummary:
     """Promote staging exports into final frame folders."""
+    pending_temp_paths = _list_pending_manual_edit_paths(config)
+    if pending_temp_paths:
+        if csv_path is not None:
+            raise ValueError(
+                "Manual edit files are still present in staging/temp. "
+                "Run apply-manual-staging-edits before promote-exports when using --csv-path."
+            )
+        if not dry_run:
+            from frame_export.error_service import apply_manual_staging_edits
+
+            apply_manual_staging_edits(
+                config,
+                temp_dir=None,
+                dry_run=False,
+            )
+
     if csv_path is None:
         rows = _read_staging_promotable_rows(config)
     else:
@@ -334,6 +350,13 @@ def promote_staging_exports(
         skipped_count=skipped_count,
         dry_run=False,
     )
+
+
+def _list_pending_manual_edit_paths(config: AppConfig) -> list[Path]:
+    temp_dir = config.photos_root / "exports" / "staging" / "temp"
+    if not temp_dir.exists() or not temp_dir.is_dir():
+        return []
+    return sorted(path for path in temp_dir.iterdir() if path.is_file())
 
 
 def delete_staging_exports(

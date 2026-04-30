@@ -15,6 +15,7 @@ def _unused_connect(_config):
 def test_run_batch_smoke_reports_exports_and_review_state(app_config, monkeypatch) -> None:
     export_ready_calls: list[dict[str, object]] = []
     frame_export_calls: list[dict[str, object]] = []
+    split_review_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr(
         "pipeline.service.run_process",
@@ -49,6 +50,12 @@ def test_run_batch_smoke_reports_exports_and_review_state(app_config, monkeypatc
         )
 
     monkeypatch.setattr("pipeline.service.run_frame_export", _fake_run_frame_export)
+    monkeypatch.setattr(
+        "pipeline.service.write_split_review_csv",
+        lambda config, csv_path, dry_run: split_review_calls.append(
+            {"config": config, "csv_path": csv_path, "dry_run": dry_run}
+        ),
+    )
     monkeypatch.setattr(
         "pipeline.service.get_task_summary",
         lambda *args, **kwargs: ReviewTaskSummary(task_counts={"review_orientation": 1}),
@@ -92,6 +99,13 @@ def test_run_batch_smoke_reports_exports_and_review_state(app_config, monkeypatc
             "width_px": 1600,
             "height_px": 1200,
             "profile_name": "archive",
+            "dry_run": False,
+        }
+    ]
+    assert split_review_calls == [
+        {
+            "config": app_config,
+            "csv_path": None,
             "dry_run": False,
         }
     ]

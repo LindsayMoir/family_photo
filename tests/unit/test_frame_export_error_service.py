@@ -256,6 +256,7 @@ def test_stage_next_exports_for_audit_reconciles_missing_staging_files_before_se
 ) -> None:
     reconciled: list[tuple[str | None, int | None, int | None, int | None]] = []
     selection_calls: list[dict[str, object]] = []
+    split_csv_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr("frame_export.error_service.connect", _fake_connect)
     monkeypatch.setattr(
@@ -288,6 +289,12 @@ def test_stage_next_exports_for_audit_reconciles_missing_staging_files_before_se
         "audit.service._open_export_audit_manual_fields",
         lambda config: {},
     )
+    monkeypatch.setattr(
+        "audit.split_review_service.write_split_review_csv",
+        lambda config, csv_path, dry_run: split_csv_calls.append(
+            {"csv_path": csv_path, "dry_run": dry_run}
+        ),
+    )
 
     summary = stage_next_exports_for_audit(
         app_config,
@@ -309,6 +316,13 @@ def test_stage_next_exports_for_audit_reconciles_missing_staging_files_before_se
             "limit": 20,
         }
     ]
+    assert summary.split_csv_path == app_config.photos_root / "exports" / "staging" / "split_review.csv"
+    assert split_csv_calls == [
+        {
+            "csv_path": app_config.photos_root / "exports" / "staging" / "split_review.csv",
+            "dry_run": False,
+        }
+    ]
 
 
 def test_stage_next_exports_for_audit_clears_unselected_staging_exports(
@@ -318,6 +332,7 @@ def test_stage_next_exports_for_audit_clears_unselected_staging_exports(
     selection_calls: list[dict[str, object]] = []
     cleared: list[tuple[str | None, int | None, set[int]]] = []
     staged: list[int] = []
+    split_csv_calls: list[dict[str, object]] = []
 
     monkeypatch.setattr("frame_export.error_service.connect", _fake_connect)
     monkeypatch.setattr(
@@ -348,6 +363,12 @@ def test_stage_next_exports_for_audit_clears_unselected_staging_exports(
         "audit.service._open_export_audit_manual_fields",
         lambda config: {},
     )
+    monkeypatch.setattr(
+        "audit.split_review_service.write_split_review_csv",
+        lambda config, csv_path, dry_run: split_csv_calls.append(
+            {"csv_path": csv_path, "dry_run": dry_run}
+        ),
+    )
 
     summary = stage_next_exports_for_audit(
         app_config,
@@ -370,6 +391,12 @@ def test_stage_next_exports_for_audit_clears_unselected_staging_exports(
             "limit": 20,
         }
     ]
+    assert split_csv_calls == [
+        {
+            "csv_path": app_config.photos_root / "exports" / "staging" / "split_review.csv",
+            "dry_run": False,
+        }
+    ]
 
 
 def test_stage_next_exports_for_audit_stages_selected_export_ready_ids(
@@ -378,6 +405,7 @@ def test_stage_next_exports_for_audit_stages_selected_export_ready_ids(
     tmp_path,
 ) -> None:
     selection_calls: list[dict[str, object]] = []
+    split_csv_calls: list[dict[str, object]] = []
     monkeypatch.setattr("frame_export.error_service.connect", _fake_connect)
     monkeypatch.setattr(
         "audit.service._reconcile_staging_export_artifacts",
@@ -492,6 +520,12 @@ def test_stage_next_exports_for_audit_stages_selected_export_ready_ids(
         "audit.service._open_export_audit_manual_fields",
         lambda config: {},
     )
+    monkeypatch.setattr(
+        "audit.split_review_service.write_split_review_csv",
+        lambda config, csv_path, dry_run: split_csv_calls.append(
+            {"csv_path": csv_path, "dry_run": dry_run}
+        ),
+    )
 
     summary = stage_next_exports_for_audit(
         app_config,
@@ -503,10 +537,17 @@ def test_stage_next_exports_for_audit_stages_selected_export_ready_ids(
     )
 
     assert summary.target == "batch-a"
+    assert summary.split_csv_path == app_config.photos_root / "exports" / "staging" / "split_review.csv"
     assert summary.selected_count == 2
     assert summary.staged_count == 2
     assert summary.audited_count == 2
     assert staged == [951, 952]
+    assert split_csv_calls == [
+        {
+            "csv_path": app_config.photos_root / "exports" / "staging" / "split_review.csv",
+            "dry_run": False,
+        }
+    ]
     assert selection_calls == [
         {
             "batch_name": "batch-a",

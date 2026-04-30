@@ -5,12 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 
+from audit.split_review_service import write_split_review_csv
 from audit.service import run_export_audit
 from config import AppConfig
 from crop.service import run_crop
 from db.connection import connect
 from deskew.service import run_deskew
-from detection.repository import SHEET_STATUS_INGESTED, count_sheet_scans_by_status, get_sheet_scans
+from detection.repository import (
+    SHEET_STATUS_INGESTED,
+    count_sheet_scans_by_status,
+    get_sheet_scans,
+    mark_sheet_scan_processing_complete_if_finished,
+)
 from detection.service import run_detection
 from enhance.service import run_enhancement
 from frame_export.service import (
@@ -122,6 +128,14 @@ def run_process(
             LOGGER.info("pipeline_photo_complete photo_id=%s", photo_id)
             photos_processed += 1
 
+        if not dry_run:
+            with connect(config) as conn:
+                mark_sheet_scan_processing_complete_if_finished(
+                    conn,
+                    sheet_scan_id=sheet.id,
+                )
+                conn.commit()
+
     target = batch_name if batch_name is not None else f"sheet_id={sheet_id}"
     return ProcessSummary(
         target=target,
@@ -180,6 +194,12 @@ def run_batch(
             dry_run=dry_run,
         )
         exported_count = export_summary.exported_count
+        if not dry_run and exported_count > 0:
+            write_split_review_csv(
+                config,
+                csv_path=None,
+                dry_run=False,
+            )
 
     review_task_counts: dict[str, int] = {}
     blocking_task = None

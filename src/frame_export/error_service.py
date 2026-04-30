@@ -76,6 +76,7 @@ class StageNextExportsSummary:
 
     target: str
     csv_path: Path
+    split_csv_path: Path
     selected_count: int
     staged_count: int
     audited_count: int
@@ -321,6 +322,7 @@ def stage_next_exports_for_audit(
         if csv_path is not None
         else config.photos_root / "exports" / "staging" / "export_audit.csv"
     )
+    split_csv_path = config.photos_root / "exports" / "staging" / "split_review.csv"
     if not dry_run:
         from audit.service import _reconcile_staging_export_artifacts
 
@@ -353,6 +355,7 @@ def stage_next_exports_for_audit(
         return StageNextExportsSummary(
             target=target,
             csv_path=output_csv_path,
+            split_csv_path=split_csv_path,
             selected_count=len(photo_ids),
             staged_count=len(photo_ids),
             audited_count=len(photo_ids),
@@ -385,9 +388,17 @@ def stage_next_exports_for_audit(
         config=config,
     )
     _write_audit_csv(output_csv_path, findings, config=config)
+    from audit.split_review_service import write_split_review_csv
+
+    write_split_review_csv(
+        config,
+        csv_path=split_csv_path,
+        dry_run=False,
+    )
     return StageNextExportsSummary(
         target=target,
         csv_path=output_csv_path,
+        split_csv_path=split_csv_path,
         selected_count=len(photo_ids),
         staged_count=len(photo_ids),
         audited_count=len(findings),

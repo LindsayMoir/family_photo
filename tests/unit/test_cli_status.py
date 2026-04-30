@@ -194,6 +194,16 @@ def test_stage_next_exports_parser_accepts_limit_and_batch() -> None:
     assert args.limit == 20
 
 
+def test_split_review_parsers_accept_csv_path() -> None:
+    parser = cli.build_parser()
+
+    write_args = parser.parse_args(["write-split-review-csv", "--csv-path", "photos/exports/staging/split_review.csv", "--dry-run"])
+    import_args = parser.parse_args(["import-split-review-csv", "--csv-path", "photos/exports/staging/split_review.csv", "--dry-run"])
+
+    assert write_args.csv_path == Path("photos/exports/staging/split_review.csv")
+    assert import_args.csv_path == Path("photos/exports/staging/split_review.csv")
+
+
 def test_reset_source_scans_parser_accepts_repeated_source_dirs() -> None:
     parser = cli.build_parser()
 
@@ -412,6 +422,7 @@ def test_handle_stage_next_exports_prints_summary(
             {
                 "target": "batch-a",
                 "csv_path": tmp_path / "photos" / "exports" / "staging" / "export_audit.csv",
+                "split_csv_path": tmp_path / "photos" / "exports" / "staging" / "split_review.csv",
                 "selected_count": 20,
                 "staged_count": 20,
                 "audited_count": 20,
@@ -438,6 +449,7 @@ def test_handle_stage_next_exports_prints_summary(
 
     assert "command=stage-next-exports" in captured.out
     assert "target=batch-a" in captured.out
+    assert "split_csv_path=" in captured.out
     assert "selected_count=20" in captured.out
     assert "staged_count=20" in captured.out
     assert "audited_count=20" in captured.out
@@ -659,3 +671,83 @@ def test_handle_apply_manual_staging_edits_prints_summary(
     assert "command=apply-manual-staging-edits" in captured.out
     assert "edited_count=2" in captured.out
     assert "staged_count=2" in captured.out
+
+
+def test_handle_write_split_review_csv_prints_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "write_split_review_csv",
+        lambda *args, **kwargs: type(
+            "Summary",
+            (),
+            {
+                "csv_path": tmp_path / "photos" / "exports" / "staging" / "split_review.csv",
+                "row_count": 127,
+                "dry_run": False,
+            },
+        )(),
+    )
+    config = AppConfig(
+        environment="test",
+        database_url="postgresql://localhost:5432/photo_db_test",
+        photos_root=tmp_path / "photos",
+        log_level="INFO",
+    )
+
+    cli._handle_write_split_review_csv(
+        config,
+        csv_path=None,
+        dry_run=False,
+    )
+    captured = capsys.readouterr()
+
+    assert "command=write-split-review-csv" in captured.out
+    assert "row_count=127" in captured.out
+
+
+def test_handle_import_split_review_csv_prints_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "import_split_review_csv",
+        lambda *args, **kwargs: type(
+            "Summary",
+            (),
+            {
+                "csv_path": tmp_path / "photos" / "exports" / "staging" / "split_review.csv",
+                "processed_rows": 127,
+                "requested_split_count": 14,
+                "applied_split_count": 11,
+                "unresolved_count": 3,
+                "created_photo_count": 12,
+                "dry_run": False,
+            },
+        )(),
+    )
+    config = AppConfig(
+        environment="test",
+        database_url="postgresql://localhost:5432/photo_db_test",
+        photos_root=tmp_path / "photos",
+        log_level="INFO",
+    )
+
+    cli._handle_import_split_review_csv(
+        config,
+        csv_path=None,
+        dry_run=False,
+    )
+    captured = capsys.readouterr()
+
+    assert "command=import-split-review-csv" in captured.out
+    assert "processed_rows=127" in captured.out
+    assert "requested_split_count=14" in captured.out
+    assert "applied_split_count=11" in captured.out
+    assert "unresolved_count=3" in captured.out
+    assert "created_photo_count=12" in captured.out

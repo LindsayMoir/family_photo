@@ -13,6 +13,7 @@ from detection.models import DetectionCandidate, SheetScanRecord
 
 SHEET_STATUS_DETECTION_COMPLETE = "detection_complete"
 SHEET_STATUS_INGESTED = "ingested"
+SHEET_STATUS_PROCESSING_COMPLETE = "processing_complete"
 
 
 def get_sheet_scans(
@@ -243,3 +244,33 @@ def replace_detections(
             )
 
     return len(candidate_list)
+
+
+def mark_sheet_scan_processing_complete_if_finished(
+    conn: PgConnection,
+    *,
+    sheet_scan_id: int,
+) -> bool:
+    """Advance one sheet scan once all of its promoted photos are fully processed."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE sheet_scans ss
+            SET status = %s,
+                updated_at = NOW()
+            WHERE ss.id = %s
+              AND ss.status = %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM photos p
+                  WHERE p.sheet_scan_id = ss.id
+                    AND p.status <> 'enhancement_complete'
+              )
+            """,
+            (
+                SHEET_STATUS_PROCESSING_COMPLETE,
+                sheet_scan_id,
+                SHEET_STATUS_DETECTION_COMPLETE,
+            ),
+        )
+        return cur.rowcount > 0

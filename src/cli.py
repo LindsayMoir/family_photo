@@ -19,6 +19,7 @@ from app_logging import configure_logging
 from audit.eval_service import run_audit_model_trial
 from audit.import_service import import_audit_csv
 from audit.fix_service import manual_split_photo
+from audit.split_review_service import import_split_review_csv, write_split_review_csv
 from audit.service import run_export_audit
 from config import AppConfig, ConfigError, load_config
 from crop.service import run_crop
@@ -72,6 +73,8 @@ STATUS_TRACKED_COMMANDS = {
     "audit-exports",
     "audit-model-trial",
     "import-audit-csv",
+    "write-split-review-csv",
+    "import-split-review-csv",
     "requeue-final-exports",
     "restage-export-errors",
     "stage-next-exports",
@@ -361,6 +364,26 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="CSV path to import. Defaults to photos/exports/staging/export_audit.csv.",
     )
+    write_split_review_parser = subparsers.add_parser(
+        "write-split-review-csv",
+        help="Write a simple image_name/Split CSV for the current staging exports.",
+    )
+    _add_dry_run_argument(write_split_review_parser)
+    write_split_review_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="CSV path to write. Defaults to photos/exports/staging/split_review.csv.",
+    )
+    import_split_review_parser = subparsers.add_parser(
+        "import-split-review-csv",
+        help="Apply Y-marked split requests from the split-review CSV using the automatic split path.",
+    )
+    _add_dry_run_argument(import_split_review_parser)
+    import_split_review_parser.add_argument(
+        "--csv-path",
+        type=Path,
+        help="CSV path to import. Defaults to photos/exports/staging/split_review.csv.",
+    )
     restage_export_errors_parser = subparsers.add_parser(
         "restage-export-errors",
         help="Restage final-export errors listed in photos/exports/errors.txt and rebuild a focused audit CSV.",
@@ -474,7 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     promote_exports_parser = subparsers.add_parser(
         "promote-exports",
-        help="Promote reviewed-good staging exports into the final frame folders.",
+        help="Promote reviewed-good staging exports into the final frame folders, auto-applying staging/temp edits first.",
     )
     _add_dry_run_argument(promote_exports_parser)
     promote_exports_parser.add_argument(
@@ -749,6 +772,20 @@ def dispatch_command(args: argparse.Namespace, config: AppConfig) -> int:
         return 0
     if args.command == "import-audit-csv":
         _handle_import_audit_csv(
+            config,
+            csv_path=args.csv_path,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "write-split-review-csv":
+        _handle_write_split_review_csv(
+            config,
+            csv_path=args.csv_path,
+            dry_run=args.dry_run,
+        )
+        return 0
+    if args.command == "import-split-review-csv":
+        _handle_import_split_review_csv(
             config,
             csv_path=args.csv_path,
             dry_run=args.dry_run,
@@ -1289,6 +1326,76 @@ def _handle_import_audit_csv(
     print(f"created_photo_count={result.created_photo_count}")
 
 
+def _handle_write_split_review_csv(
+    config: AppConfig,
+    *,
+    csv_path: Path | None,
+    dry_run: bool,
+) -> None:
+    resolved_csv_path = (
+        csv_path
+        if csv_path is not None
+        else config.photos_root / "exports" / "staging" / "split_review.csv"
+    )
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="write-split-review-csv",
+                target=str(resolved_csv_path),
+                dry_run=True,
+                notes=("write image_name/Split review CSV for current staging exports",),
+            )
+        )
+        return
+
+    result = write_split_review_csv(
+        config,
+        csv_path=resolved_csv_path,
+        dry_run=False,
+    )
+    print("command=write-split-review-csv")
+    print(f"csv_path={result.csv_path}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"row_count={result.row_count}")
+
+
+def _handle_import_split_review_csv(
+    config: AppConfig,
+    *,
+    csv_path: Path | None,
+    dry_run: bool,
+) -> None:
+    resolved_csv_path = (
+        csv_path
+        if csv_path is not None
+        else config.photos_root / "exports" / "staging" / "split_review.csv"
+    )
+    if dry_run:
+        _print_plan(
+            CommandPlan(
+                command_name="import-split-review-csv",
+                target=str(resolved_csv_path),
+                dry_run=True,
+                notes=("auto-split only rows with Split=Y and restage the resulting photos",),
+            )
+        )
+        return
+
+    result = import_split_review_csv(
+        config,
+        csv_path=resolved_csv_path,
+        dry_run=False,
+    )
+    print("command=import-split-review-csv")
+    print(f"csv_path={result.csv_path}")
+    print(f"dry_run={str(result.dry_run).lower()}")
+    print(f"processed_rows={result.processed_rows}")
+    print(f"requested_split_count={result.requested_split_count}")
+    print(f"applied_split_count={result.applied_split_count}")
+    print(f"unresolved_count={result.unresolved_count}")
+    print(f"created_photo_count={result.created_photo_count}")
+
+
 def _handle_restage_export_errors(
     config: AppConfig,
     *,
@@ -1421,6 +1528,7 @@ def _handle_stage_next_exports(
     print("command=stage-next-exports")
     print(f"target={result.target}")
     print(f"csv_path={result.csv_path}")
+    print(f"split_csv_path={result.split_csv_path}")
     print(f"dry_run={str(result.dry_run).lower()}")
     print(f"selected_count={result.selected_count}")
     print(f"staged_count={result.staged_count}")

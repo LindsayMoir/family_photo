@@ -208,6 +208,46 @@ What that does:
 - split files create child photos through the manual split path
 - all resulting images are rerun through the normal export pipeline and restaged
 
+Operational note:
+
+- `python src/cli.py promote-exports` now auto-applies any pending `staging/temp` edits before promoting
+- if you use `--csv-path`, apply temp edits first so the CSV stays aligned with the staged set
+
+### Optional: split-only review CSV
+
+If you want a narrow CSV that only tracks whether a staged image should be split:
+
+```bash
+python src/cli.py write-split-review-csv
+```
+
+This writes:
+
+- [photos/exports/staging/split_review.csv](/mnt/d/GitHub/family_photo/photos/exports/staging/split_review.csv)
+
+The file has 2 columns:
+
+- `image_name`
+- `Split`
+
+Operator rules:
+
+- mark `Split` as `Y` only for images that should be auto-split
+- leave `Split` as `N` for everything else
+
+Then apply the selected splits:
+
+```bash
+python src/cli.py import-split-review-csv
+```
+
+What that does:
+
+- reads only rows marked `Split=Y`
+- runs those photos through the existing automatic split path
+- restages the resulting photos for review
+- leaves non-split images unchanged
+
 ### Optional: rebuild the audit snapshot
 
 If you want a CSV snapshot of current staging:
@@ -248,6 +288,8 @@ python src/cli.py promote-exports --csv-path photos/exports/staging/export_audit
 ```bash
 python src/cli.py run-batch --batch book_1_600dpi --limit 20
 python src/cli.py stage-next-exports --batch book_1_600dpi --limit 20
+python src/cli.py write-split-review-csv
+python src/cli.py import-split-review-csv
 python src/cli.py apply-manual-staging-edits
 python src/cli.py promote-exports
 ```
@@ -256,10 +298,12 @@ In practice you will usually:
 
 1. run `stage-next-exports`
 2. visually inspect staging
-3. edit files in `staging/temp`
-4. run `apply-manual-staging-edits`
-5. repeat until staging looks right
-6. run `promote-exports`
+3. optionally mark split candidates in `split_review.csv`
+4. run `import-split-review-csv`
+5. edit files in `staging/temp` for anything that still needs manual work
+6. optionally run `apply-manual-staging-edits` to preview the restaged result before promotion
+7. repeat until staging looks right
+8. run `promote-exports`
 
 ### Manual split for a MERGE photo
 
@@ -361,6 +405,7 @@ pytest -q
 - staging is the operator review area
 - `staging/temp` is the operator override area
 - promotion no longer requires the audit CSV unless you explicitly choose CSV-gated promotion
+- `split_review.csv` is the narrow operator checklist for split-or-not decisions
 - small review batches are the expected operating model
 - `run-batch` is useful for processing sheets, but `stage-next-exports` is the better command for shaping the review slice
 
@@ -376,4 +421,3 @@ pytest -q
   Next-batch staging, temp edits, and requeue utilities.
 - [src/audit/fix_service.py](/mnt/d/GitHub/family_photo/src/audit/fix_service.py)
   Manual split and export-fix logic.
-

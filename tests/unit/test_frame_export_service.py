@@ -86,6 +86,85 @@ def test_promote_staging_exports_uses_staging_artifacts_when_csv_is_omitted(
     assert deleted == [(951, "frame_export_staging", str(staging_path))]
 
 
+def test_promote_staging_exports_applies_pending_manual_temp_files(
+    app_config,
+    monkeypatch,
+) -> None:
+    temp_dir = app_config.photos_root / "exports" / "staging" / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    (temp_dir / "photo_951.jpg").write_bytes(b"edited")
+    applied: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        "frame_export.error_service.apply_manual_staging_edits",
+        lambda config, temp_dir, dry_run: applied.append((config, temp_dir, dry_run)),
+    )
+    monkeypatch.setattr(
+        "frame_export.service._read_staging_promotable_rows",
+        lambda config: [],
+    )
+    class _FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    class _FakeConn:
+        def cursor(self):
+            return _FakeCursor()
+
+        def commit(self) -> None:
+            return None
+
+    @contextmanager
+    def _fake_connect(_config):
+        yield _FakeConn()
+
+    monkeypatch.setattr("frame_export.service.connect", _fake_connect)
+
+    summary = promote_staging_exports(
+        app_config,
+        csv_path=None,
+        dry_run=False,
+    )
+
+    assert summary.promoted_count == 0
+    assert summary.skipped_count == 0
+    assert applied == [
+        (
+            app_config,
+            None,
+            False,
+        )
+    ]
+
+
+def test_promote_staging_exports_rejects_pending_manual_temp_files_with_csv_path(
+    app_config,
+    tmp_path,
+) -> None:
+    temp_dir = app_config.photos_root / "exports" / "staging" / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    (temp_dir / "photo_951.jpg").write_bytes(b"edited")
+    csv_path = tmp_path / "export_audit.csv"
+    csv_path.write_text("row_type,photo_id,export_path,needs_help\n", encoding="utf-8")
+
+    try:
+        promote_staging_exports(
+            app_config,
+            csv_path=csv_path,
+            dry_run=False,
+        )
+    except ValueError as exc:
+        assert str(exc) == (
+            "Manual edit files are still present in staging/temp. "
+            "Run apply-manual-staging-edits before promote-exports when using --csv-path."
+        )
+    else:
+        raise AssertionError("Expected pending temp files to block CSV-gated promote_staging_exports.")
+
+
 def test_compute_face_aware_crop_offsets_returns_centered_crop_without_faces(monkeypatch) -> None:
     image = np.zeros((200, 100, 3), dtype=np.uint8)
     monkeypatch.setattr("frame_export.service._detect_face_boxes", lambda image: ())

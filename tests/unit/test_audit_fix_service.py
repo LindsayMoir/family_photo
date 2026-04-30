@@ -10,6 +10,7 @@ from audit.fix_service import (
     _is_supported_issue,
     _task_issue_codes,
     PhotoRepairContext,
+    auto_split_photo,
     apply_export_audit_fixes,
     manual_split_photo,
 )
@@ -279,6 +280,46 @@ def test_manual_split_photo_restages_operator_supplied_children(
         (1105, "excluded_via_manual_split"),
         (1200, "fixed_via_manual_split"),
         (1201, "fixed_via_manual_split"),
+    ]
+
+
+def test_auto_split_photo_resolves_open_export_task_when_present(
+    app_config,
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        "audit.fix_service._auto_split_photo_ids",
+        lambda config, photo_id: [photo_id, 1200],
+    )
+    monkeypatch.setattr(
+        "audit.fix_service._find_open_export_audit_task_id",
+        lambda config, photo_id: 1871,
+    )
+    resolved: list[tuple[int, str, str | None]] = []
+    monkeypatch.setattr(
+        "audit.fix_service.resolve_export_audit_review",
+        lambda config, task_id, export_action, note, dry_run: resolved.append((task_id, export_action, note)),
+    )
+    orientation_calls: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        "audit.fix_service.resolve_orientation_review_for_photo",
+        lambda config, photo_id, action: orientation_calls.append((photo_id, action)),
+    )
+
+    summary = auto_split_photo(
+        app_config,
+        photo_id=1105,
+        note="split review csv applied",
+        dry_run=False,
+    )
+
+    assert summary.photo_id == 1105
+    assert summary.staged_photo_ids == (1105, 1200)
+    assert summary.resolved_task_id == 1871
+    assert resolved == [(1871, "fix_crop", "split review csv applied")]
+    assert orientation_calls == [
+        (1105, "fixed_via_export_audit"),
+        (1200, "fixed_via_export_audit"),
     ]
 
 
